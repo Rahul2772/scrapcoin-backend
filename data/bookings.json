@@ -1,0 +1,17 @@
+[
+  {
+    "id": "487ce227-2a00-484d-aac5-104fd9d9ef4b",
+    "fullName": "Test User",
+    "phone": "+91 9876543210",
+    "society": "Gaur City 2",
+    "tower": "Tower B 1204",
+    "pickupDate": "2026-06-10",
+    "materials": [
+      "Paper / Cardboard",
+      "Metals"
+    ],
+    "status": "scheduled",
+    "createdAt": "2026-06-07T07:08:01.106Z",
+    "updatedAt": "2026-06-07T07:08:01.106Z"
+  }
+]
