@@ -11,31 +11,33 @@ const DEMO_WEIGHTS: Record<string, number> = {
   "e-waste": 0.5,
 };
 
-function buildDemoPickup(): LivePickup {
-  const categories = getCategories();
-  const items = categories
-    .filter((c) => DEMO_WEIGHTS[c.id] !== undefined)
-    .map((c) => ({
-      label: c.name.split(" / ")[0] ?? c.name,
-      weightKg: DEMO_WEIGHTS[c.id],
-      categoryId: c.id,
-    }));
+livePickupRouter.get("/demo", async (_req, res) => {
+  try {
+    const categories = await getCategories();
+    const items = categories
+      .filter((c) => DEMO_WEIGHTS[c.id] !== undefined)
+      .map((c) => ({
+        label: c.name.split(" / ")[0] ?? c.name,
+        weightKg: DEMO_WEIGHTS[c.id],
+        categoryId: c.id,
+      }));
 
-  const payoutAmount = items.reduce((sum, item) => {
-    const category = categories.find((c) => c.id === item.categoryId);
-    return sum + item.weightKg * (category?.pricePerUnit ?? 0);
-  }, 0);
+    const payoutAmount = items.reduce((sum, item) => {
+      const category = categories.find((c) => c.id === item.categoryId);
+      return sum + item.weightKg * (category?.pricePerUnit ?? 0);
+    }, 0);
 
-  return {
-    id: "demo-live-pickup",
-    location: "Tower B-204 • Sector 16C",
-    status: "in_progress",
-    items,
-    payoutAmount: Math.round(payoutAmount * 100) / 100,
-    currency: "INR",
-  };
-}
+    const pickup: LivePickup = {
+      id: "demo-live-pickup",
+      location: "Sample Pickup • Greater Noida West",
+      status: "in_progress",
+      items,
+      payoutAmount: Math.round(payoutAmount * 100) / 100,
+      currency: "INR",
+    };
 
-livePickupRouter.get("/demo", (_req, res) => {
-  res.json(buildDemoPickup());
+    res.json(pickup);
+  } catch {
+    res.status(500).json({ error: "Failed to build demo pickup" });
+  }
 });

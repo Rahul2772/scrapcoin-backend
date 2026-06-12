@@ -1,56 +1,86 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { createClient } from "@supabase/supabase-js";
 import type { Booking, ScrapCategory } from "../types.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = join(__dirname, "../../data");
-const BOOKINGS_FILE = join(DATA_DIR, "bookings.json");
-const CATEGORIES_FILE = join(DATA_DIR, "categories.json");
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_KEY!
+);
 
-const DEFAULT_CATEGORIES: ScrapCategory[] = [
-  { id: "cardboard", name: "Paper / Cardboard", unit: "kg", pricePerUnit: 12 },
-  { id: "plastics", name: "Plastics", unit: "kg", pricePerUnit: 18 },
-  { id: "metals", name: "Metals", unit: "kg", pricePerUnit: 35 },
-  { id: "e-waste", name: "E-Waste", unit: "kg", pricePerUnit: 22 },
-  { id: "others", name: "Others", unit: "kg", pricePerUnit: 10 },
-];
+// ── Categories ──────────────────────────────────────────
 
-function ensureDataDir() {
-  if (!existsSync(DATA_DIR)) {
-    mkdirSync(DATA_DIR, { recursive: true });
-  }
+export async function getCategories(): Promise<ScrapCategory[]> {
+  const { data, error } = await supabase
+    .from("categories")
+    .select("*");
+
+  if (error) throw new Error(error.message);
+
+  return data.map((r) => ({
+    id: r.id,
+    name: r.name,
+    unit: r.unit as "kg",
+    pricePerUnit: Number(r.price_per_unit),
+  }));
 }
 
-function readJson<T>(filePath: string, fallback: T): T {
-  ensureDataDir();
-  if (!existsSync(filePath)) {
-    writeFileSync(filePath, JSON.stringify(fallback, null, 2), "utf-8");
-    return fallback;
-  }
-  return JSON.parse(readFileSync(filePath, "utf-8")) as T;
+// ── Bookings ─────────────────────────────────────────────
+
+export async function getBookings(): Promise<Booking[]> {
+  const { data, error } = await supabase
+    .from("bookings")
+    .select("*")
+    .order("created_at", { ascending: false });
+
+  if (error) throw new Error(error.message);
+  return data.map(rowToBooking);
 }
 
-function writeJson<T>(filePath: string, data: T) {
-  ensureDataDir();
-  writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
-}
+export async function saveBooking(booking: Booking): Promise<Booking> {
+  const { error } = await supabase.from("bookings").insert({
+    id: booking.id,
+    full_name: booking.fullName,
+    phone: booking.phone,
+    society: booking.society,
+    tower: booking.tower ?? null,
+    pickup_date: booking.pickupDate,
+    materials: booking.materials,
+    status: booking.status,
+    created_at: booking.createdAt,
+    updated_at: booking.updatedAt,
+  });
 
-export function getCategories(): ScrapCategory[] {
-  return readJson(CATEGORIES_FILE, DEFAULT_CATEGORIES);
-}
-
-export function getBookings(): Booking[] {
-  return readJson<Booking[]>(BOOKINGS_FILE, []);
-}
-
-export function saveBooking(booking: Booking): Booking {
-  const bookings = getBookings();
-  bookings.unshift(booking);
-  writeJson(BOOKINGS_FILE, bookings);
+  if (error) throw new Error(error.message);
   return booking;
 }
 
-export function getBookingById(id: string): Booking | undefined {
-  return getBookings().find((b) => b.id === id);
+export async function getBookingById(id: string): Promise<Booking | undefined> {
+  const { data, error } = await supabase
+    .from("bookings")
+    .select("*")
+    .eq("id", id)
+    .single();
+
+  if (error) {
+    if (error.code === "PGRST116") return undefined; // not found
+    throw new Error(error.message);
+  }
+
+  return rowToBooking(data);
+}
+
+// ── Helper ────────────────────────────────────────────────
+
+function rowToBooking(r: Record<string, unknown>): Booking {
+  return {
+    id: r.id as string,
+    fullName: r.full_name as string,
+    phone: r.phone as string,
+    society: r.society as string,
+    tower: r.tower as string | undefined,
+    pickupDate: r.pickup_date as string,
+    materials: r.materials as string[],
+    status: r.status as Booking["status"],
+    createdAt: r.created_at as string,
+    updatedAt: r.updated_at as string,
+  };
 }

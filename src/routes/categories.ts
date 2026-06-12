@@ -3,6 +3,11 @@ import { getCategories } from "../db/store.js";
 
 export const categoriesRouter = Router();
 
-categoriesRouter.get("/", (_req, res) => {
-  res.json(getCategories());
+categoriesRouter.get("/", async (_req, res) => {
+  try {
+    const categories = await getCategories();
+    res.json(categories);
+  } catch {
+    res.status(500).json({ error: "Failed to fetch categories" });
+  }
 });

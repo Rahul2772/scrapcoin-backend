@@ -8,11 +8,9 @@ const app = express();
 const port = Number(process.env.PORT ?? 4000);
 const corsOrigin = process.env.CORS_ORIGIN ?? "http://localhost:5173";
 
-app.use(
-  cors({
-    origin: corsOrigin.split(",").map((o) => o.trim()),
-  }),
-);
+app.use(cors({
+  origin: corsOrigin.split(",").map((o) => o.trim()),
+}));
 app.use(express.json());
 
 app.get("/health", (_req, res) => {
