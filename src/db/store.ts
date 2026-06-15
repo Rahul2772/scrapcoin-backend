@@ -1,10 +1,5 @@
-import { createClient } from "@supabase/supabase-js";
 import type { Booking, BookingStatus, ScrapCategory } from "../types.js";
-
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_KEY!
-);
+import { supabase } from "../lib/supabase.js";
 
 // ── Categories ──────────────────────────────────────────
 

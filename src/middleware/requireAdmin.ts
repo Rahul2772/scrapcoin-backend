@@ -1,10 +1,5 @@
-import { createClient } from "@supabase/supabase-js";
 import type { NextFunction, Request, Response } from "express";
-
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_KEY!
-);
+import { supabase } from "../lib/supabase.js";
 
 export interface AdminUser {
   id: string;

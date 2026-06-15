@@ -1,12 +1,7 @@
-import { createClient } from "@supabase/supabase-js";
 import { Router } from "express";
 import { z } from "zod";
 import { requireAdmin } from "../middleware/requireAdmin.js";
-
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_KEY!
-);
+import { supabase } from "../lib/supabase.js";
 
 export const adminRouter = Router();
 
