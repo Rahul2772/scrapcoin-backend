@@ -6,6 +6,10 @@ import { categoriesRouter } from "./routes/categories.js";
 import { livePickupRouter } from "./routes/live-pickup.js";
 
 const app = express();
+// Behind proxies (e.g. Railway, Vercel), enable trust proxy so
+// express-rate-limit can correctly identify client IPs from
+// the X-Forwarded-For header.
+app.set("trust proxy", true);
 const port = Number(process.env.PORT ?? 4000);
 const corsOrigin = process.env.CORS_ORIGIN ?? "http://localhost:5173";
 
