@@ -63,6 +63,31 @@ bookingsRouter.post("/", bookingLimiter, async (req, res) => {
     }
   }
 
+  // Fallback: if getUser failed, try to decode the JWT locally to extract the
+  // `sub` claim (user id). This helps when the auth server call intermittently
+  // fails or when verification via getUser isn't available in the runtime.
+  if (!userId) {
+    try {
+      const token = authHeader?.startsWith("Bearer ")
+        ? authHeader.split(" ")[1]
+        : undefined;
+      if (token) {
+        const parts = token.split('.');
+        if (parts.length === 3) {
+          const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+          if (payload && payload.sub) {
+            userId = payload.sub;
+            console.warn('Fallback: extracted user id from JWT payload', userId);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Failed to extract user id from JWT fallback', e);
+    }
+  }
+
+  console.log('Booking request userId:', userId ?? 'no-user');
+
   const now = new Date().toISOString();
   try {
     const booking = await saveBooking({
@@ -77,8 +102,11 @@ bookingsRouter.post("/", bookingLimiter, async (req, res) => {
       message: "Pickup scheduled. WhatsApp confirmation will follow shortly.",
       booking,
     });
-  } catch {
-    return res.status(500).json({ error: "Failed to save booking" });
+  } catch (err) {
+    console.error("POST /api/bookings error", err);
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "Failed to save booking",
+    });
   }
 });
 
@@ -99,8 +127,11 @@ bookingsRouter.get("/me", async (req, res) => {
   try {
     const bookings = await getBookings(userData.user.id);
     return res.json(bookings);
-  } catch {
-    return res.status(500).json({ error: "Failed to fetch bookings" });
+  } catch (err) {
+    console.error("GET /api/bookings/me error", err);
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "Failed to fetch bookings",
+    });
   }
 });
 

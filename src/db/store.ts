@@ -73,7 +73,14 @@ export async function getBookings(userId?: string): Promise<Booking[]> {
     ? await query.eq("user_id", userId)
     : await query;
 
-  if (error) throw new Error(error.message);
+  if (error) {
+    if (error.message?.includes("user_id") && error.message.includes("does not exist")) {
+      throw new Error(
+        "Supabase bookings table is missing the user_id column. Add user_id to bookings."
+      );
+    }
+    throw new Error(error.message);
+  }
   return data.map(rowToBooking);
 }
 
@@ -96,7 +103,14 @@ export async function saveBooking(booking: Booking): Promise<Booking> {
   }
 
   const { error } = await supabase.from("bookings").insert(insertPayload);
-  if (error) throw new Error(error.message);
+  if (error) {
+    if (error.message?.includes("user_id") && error.message.includes("does not exist")) {
+      throw new Error(
+        "Supabase bookings table is missing the user_id column. Add user_id to bookings."
+      );
+    }
+    throw new Error(error.message);
+  }
   return booking;
 }
 
