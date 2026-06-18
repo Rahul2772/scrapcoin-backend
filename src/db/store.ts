@@ -96,6 +96,7 @@ export async function saveBooking(booking: Booking): Promise<Booking> {
     status: booking.status,
     created_at: booking.createdAt,
     updated_at: booking.updatedAt,
+    actual_weights: booking.actualWeights ?? {},
   };
 
   if (booking.userId) {
@@ -129,11 +130,20 @@ export async function getBookingById(id: string): Promise<Booking | undefined> {
 
 export async function updateBookingStatus(
   id: string,
-  status: BookingStatus
+  status: BookingStatus,
+  actualWeights?: Record<string, number>
 ): Promise<Booking | undefined> {
+  const updatePayload: Record<string, unknown> = {
+    status,
+    updated_at: new Date().toISOString(),
+  };
+  if (actualWeights) {
+    updatePayload.actual_weights = actualWeights;
+  }
+
   const { data, error } = await supabase
     .from("bookings")
-    .update({ status, updated_at: new Date().toISOString() })
+    .update(updatePayload)
     .eq("id", id)
     .select()
     .single();
@@ -158,5 +168,7 @@ function rowToBooking(r: Record<string, unknown>): Booking {
     status: r.status as Booking["status"],
     createdAt: r.created_at as string,
     updatedAt: r.updated_at as string,
+    userId: r.user_id as string | undefined,
+    actualWeights: r.actual_weights as Record<string, number> | undefined,
   };
 }

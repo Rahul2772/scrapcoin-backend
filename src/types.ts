@@ -19,6 +19,7 @@ export type Booking = {
   createdAt: string;
   updatedAt: string;
   userId?: string;
+  actualWeights?: Record<string, number>;
 };
 
 export type LivePickupItem = {

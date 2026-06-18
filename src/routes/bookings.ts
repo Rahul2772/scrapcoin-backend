@@ -3,6 +3,7 @@ import { Router } from "express";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { requireAdmin } from "../middleware/requireAdmin.js";
+import { requireAdminOrChampion } from "../middleware/requireAdminOrChampion.js";
 import { supabase } from "../lib/supabase.js";
 import {
   getBookingById,
@@ -29,12 +30,13 @@ const bookingSchema = z.object({
 
 const statusSchema = z.object({
   status: z.enum(["scheduled", "in_progress", "completed", "cancelled"]),
+  actualWeights: z.record(z.string(), z.number().nonnegative()).optional(),
 });
 
 export const bookingsRouter = Router();
 
-// GET /api/bookings � list all bookings (admin only)
-bookingsRouter.get("/", requireAdmin, async (_req, res) => {
+// GET /api/bookings — list all bookings (admin/champion)
+bookingsRouter.get("/", requireAdminOrChampion, async (_req, res) => {
   try {
     const bookings = await getBookings();
     return res.json(bookings);
@@ -114,8 +116,8 @@ bookingsRouter.get("/me", async (req, res) => {
   }
 });
 
-// GET /api/bookings/:id — get single booking (admin only)
-bookingsRouter.get("/:id", requireAdmin, async (req, res) => {
+// GET /api/bookings/:id — get single booking (admin/champion)
+bookingsRouter.get("/:id", requireAdminOrChampion, async (req, res) => {
   try {
     const booking = await getBookingById(String(req.params.id));
     if (!booking) return res.status(404).json({ error: "Booking not found" });
@@ -125,8 +127,8 @@ bookingsRouter.get("/:id", requireAdmin, async (req, res) => {
   }
 });
 
-// PATCH /api/bookings/:id — update booking status (admin only)
-bookingsRouter.patch("/:id", requireAdmin, async (req, res) => {
+// PATCH /api/bookings/:id — update booking status (admin/champion)
+bookingsRouter.patch("/:id", requireAdminOrChampion, async (req, res) => {
   const parsed = statusSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({
@@ -137,7 +139,8 @@ bookingsRouter.patch("/:id", requireAdmin, async (req, res) => {
   try {
     const booking = await updateBookingStatus(
       String(req.params.id),
-      parsed.data.status
+      parsed.data.status,
+      parsed.data.actualWeights
     );
     if (!booking) return res.status(404).json({ error: "Booking not found" });
     return res.json(booking);
