@@ -63,15 +63,20 @@ export async function deleteCategory(id: string): Promise<void> {
 
 // ── Bookings ─────────────────────────────────────────────
 
-export async function getBookings(userId?: string): Promise<Booking[]> {
-  const query = supabase
+export async function getBookings(userId?: string, championId?: string): Promise<Booking[]> {
+  let query = supabase
     .from("bookings")
-    .select("*")
+    .select("*, champion_profile:champion_id(email)")
     .order("created_at", { ascending: false });
 
-  const { data, error } = userId
-    ? await query.eq("user_id", userId)
-    : await query;
+  if (userId) {
+    query = query.eq("user_id", userId);
+  }
+  if (championId) {
+    query = query.eq("champion_id", championId);
+  }
+
+  const { data, error } = await query;
 
   if (error) {
     if (error.message?.includes("user_id") && error.message.includes("does not exist")) {
@@ -97,6 +102,7 @@ export async function saveBooking(booking: Booking): Promise<Booking> {
     created_at: booking.createdAt,
     updated_at: booking.updatedAt,
     actual_weights: booking.actualWeights ?? {},
+    champion_id: booking.championId ?? null,
   };
 
   if (booking.userId) {
@@ -118,7 +124,7 @@ export async function saveBooking(booking: Booking): Promise<Booking> {
 export async function getBookingById(id: string): Promise<Booking | undefined> {
   const { data, error } = await supabase
     .from("bookings")
-    .select("*")
+    .select("*, champion_profile:champion_id(email)")
     .eq("id", id)
     .single();
   if (error) {
@@ -128,24 +134,32 @@ export async function getBookingById(id: string): Promise<Booking | undefined> {
   return rowToBooking(data);
 }
 
-export async function updateBookingStatus(
+export async function updateBooking(
   id: string,
-  status: BookingStatus,
-  actualWeights?: Record<string, number>
+  updates: {
+    status?: BookingStatus;
+    actualWeights?: Record<string, number>;
+    championId?: string | null;
+  }
 ): Promise<Booking | undefined> {
   const updatePayload: Record<string, unknown> = {
-    status,
     updated_at: new Date().toISOString(),
   };
-  if (actualWeights) {
-    updatePayload.actual_weights = actualWeights;
+  if (updates.status !== undefined) {
+    updatePayload.status = updates.status;
+  }
+  if (updates.actualWeights !== undefined) {
+    updatePayload.actual_weights = updates.actualWeights;
+  }
+  if (updates.championId !== undefined) {
+    updatePayload.champion_id = updates.championId;
   }
 
   const { data, error } = await supabase
     .from("bookings")
     .update(updatePayload)
     .eq("id", id)
-    .select()
+    .select("*, champion_profile:champion_id(email)")
     .single();
   if (error) {
     if (error.code === "PGRST116") return undefined;
@@ -157,6 +171,7 @@ export async function updateBookingStatus(
 // ── Helper ────────────────────────────────────────────────
 
 function rowToBooking(r: Record<string, unknown>): Booking {
+  const championProfile = r.champion_profile as { email: string } | null;
   return {
     id: r.id as string,
     fullName: r.full_name as string,
@@ -170,5 +185,7 @@ function rowToBooking(r: Record<string, unknown>): Booking {
     updatedAt: r.updated_at as string,
     userId: r.user_id as string | undefined,
     actualWeights: r.actual_weights as Record<string, number> | undefined,
+    championId: r.champion_id as string | undefined,
+    championEmail: championProfile?.email,
   };
 }

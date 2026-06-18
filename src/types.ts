@@ -20,6 +20,8 @@ export type Booking = {
   updatedAt: string;
   userId?: string;
   actualWeights?: Record<string, number>;
+  championId?: string;
+  championEmail?: string;
 };
 
 export type LivePickupItem = {

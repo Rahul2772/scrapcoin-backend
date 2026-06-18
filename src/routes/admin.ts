@@ -23,6 +23,23 @@ adminRouter.get("/users", async (_req, res) => {
   }
 });
 
+// GET /api/admin/champions — list all champions
+adminRouter.get("/champions", async (_req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, email, role")
+      .eq("role", "champion")
+      .order("email", { ascending: true });
+
+    if (error) throw new Error(error.message);
+    return res.json(data);
+  } catch (err) {
+    console.error("GET /api/admin/champions error:", err);
+    return res.status(500).json({ error: "Failed to fetch champions" });
+  }
+});
+
 // PATCH /api/admin/users/:id — update user role
 adminRouter.patch("/users/:id", async (req, res) => {
   const parsed = z

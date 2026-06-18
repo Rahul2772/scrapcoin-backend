@@ -9,7 +9,7 @@ import {
   getBookingById,
   getBookings,
   saveBooking,
-  updateBookingStatus,
+  updateBooking,
 } from "../db/store.js";
 
 const bookingLimiter = rateLimit({
@@ -29,18 +29,24 @@ const bookingSchema = z.object({
 });
 
 const statusSchema = z.object({
-  status: z.enum(["scheduled", "in_progress", "completed", "cancelled"]),
+  status: z.enum(["scheduled", "in_progress", "completed", "cancelled"]).optional(),
   actualWeights: z.record(z.string(), z.number().nonnegative()).optional(),
+  championId: z.string().nullable().optional(),
 });
 
 export const bookingsRouter = Router();
 
 // GET /api/bookings — list all bookings (admin/champion)
-bookingsRouter.get("/", requireAdminOrChampion, async (_req, res) => {
+bookingsRouter.get("/", requireAdminOrChampion, async (req, res) => {
   try {
-    const bookings = await getBookings();
+    const isChampion = req.privilegedUser?.role === "champion";
+    const bookings = await getBookings(
+      undefined,
+      isChampion ? req.privilegedUser?.id : undefined
+    );
     return res.json(bookings);
-  } catch {
+  } catch (err) {
+    console.error("GET /api/bookings error:", err);
     return res.status(500).json({ error: "Failed to fetch bookings" });
   }
 });
@@ -127,24 +133,31 @@ bookingsRouter.get("/:id", requireAdminOrChampion, async (req, res) => {
   }
 });
 
-// PATCH /api/bookings/:id — update booking status (admin/champion)
+// PATCH /api/bookings/:id — update booking status/assignment (admin/champion)
 bookingsRouter.patch("/:id", requireAdminOrChampion, async (req, res) => {
   const parsed = statusSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({
-      error: "Invalid status value",
+      error: "Invalid update payload",
       details: parsed.error.flatten(),
     });
   }
+
+  // Champions cannot modify who is assigned to a booking
+  if (req.privilegedUser?.role === "champion" && parsed.data.championId !== undefined) {
+    return res.status(403).json({ error: "Champions cannot assign or modify champion assignment" });
+  }
+
   try {
-    const booking = await updateBookingStatus(
-      String(req.params.id),
-      parsed.data.status,
-      parsed.data.actualWeights
-    );
+    const booking = await updateBooking(String(req.params.id), {
+      status: parsed.data.status,
+      actualWeights: parsed.data.actualWeights,
+      championId: parsed.data.championId,
+    });
     if (!booking) return res.status(404).json({ error: "Booking not found" });
     return res.json(booking);
-  } catch {
-    return res.status(500).json({ error: "Failed to update booking status" });
+  } catch (err) {
+    console.error("PATCH /api/bookings/:id error:", err);
+    return res.status(500).json({ error: "Failed to update booking" });
   }
 });
