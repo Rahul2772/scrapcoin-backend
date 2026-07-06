@@ -21,6 +21,10 @@ app.use(
 );
 app.use(express.json());
 
+app.get("/", (_req, res) => {
+  res.json({ message: "Welcome to The Scrap Co. API backend", status: "ok" });
+});
+
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "backend_scrapco" });
 });
