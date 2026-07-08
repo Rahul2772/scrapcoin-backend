@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { requireAdminOrChampion } from "../middleware/requireAdminOrChampion.js";
 import { supabase } from "../lib/supabase.js";
+import { sendWhatsAppMessage } from "../lib/twilio.js";
 
 export const erpRouter = Router();
 
@@ -1187,7 +1188,7 @@ erpRouter.delete("/purchase-receipts/:id", async (req, res) => {
 
 // ── 7. WHATSAPP & PDF SIMULATOR (MOCKED) ────────────────────────────────────────
 
-// POST /api/erp/whatsapp/send/:transactionId — Simulate PDF generation + WhatsApp Alert
+// POST /api/erp/whatsapp/send/:transactionId — Send Transaction PDF Receipt via WhatsApp (Twilio / Mock)
 erpRouter.post("/whatsapp/send/:transactionId", async (req, res) => {
   try {
     // 1. Fetch transaction details
@@ -1219,21 +1220,45 @@ erpRouter.post("/whatsapp/send/:transactionId", async (req, res) => {
     // Simulate PDF generation by creating a mock url
     const mockPdfUrl = `https://mtzvoeohbifxmertnwwy.supabase.co/storage/v1/object/public/invoices/mock_invoice_${invoices?.invoice_number || t.txn_number}.pdf`;
 
+    const supplierName = t.erp_suppliers.name;
+    const materialName = t.erp_materials.name;
+    const weight = t.weight;
+    const unit = t.unit || "kg";
+    const totalAmount = t.total_amount;
+    const txnNumber = t.txn_number;
+
+    // Construct the WhatsApp message body
+    const body = `Hello ${supplierName},\n\nYour transaction ${txnNumber} has been recorded.\nMaterial: ${materialName}\nWeight: ${weight} ${unit}\nTotal Amount: ₹${totalAmount}\n\nInvoice PDF: ${mockPdfUrl}\n\nThank you for partnering with The Scrap Co.!`;
+
+    // Send the message using the Twilio client
+    const result = await sendWhatsAppMessage(phone, body);
+
     // Insert log to DB
     const { error: logErr } = await supabase.from("erp_whatsapp_logs").insert({
       transaction_id: t.id,
       supplier_phone: phone,
-      status: "sent",
-      message_id: `mock-msg-${Math.random().toString(36).substr(2, 9)}`,
-      provider: "mock",
+      status: result.success ? "sent" : "failed",
+      message_id: result.messageId || null,
+      provider: result.isMocked ? "mock" : "twilio",
       pdf_url: mockPdfUrl,
+      error: result.error || null,
     });
 
     if (logErr) throw logErr;
 
+    if (!result.success) {
+      return res.status(502).json({
+        success: false,
+        message: `Failed to dispatch WhatsApp message via Twilio: ${result.error}`,
+        pdfUrl: mockPdfUrl,
+      });
+    }
+
     res.json({
       success: true,
-      message: `WhatsApp receipt simulated successfully and sent to ${phone} (Mock Provider)`,
+      message: result.isMocked
+        ? `WhatsApp receipt simulated successfully and logged (Mock Provider) to ${phone}`
+        : `WhatsApp receipt dispatched successfully via Twilio to ${phone}`,
       pdfUrl: mockPdfUrl,
     });
   } catch (err: any) {

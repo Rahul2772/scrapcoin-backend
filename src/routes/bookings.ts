@@ -5,6 +5,7 @@ import { z } from "zod";
 import { requireAdmin } from "../middleware/requireAdmin.js";
 import { requireAdminOrChampion } from "../middleware/requireAdminOrChampion.js";
 import { supabase } from "../lib/supabase.js";
+import { sendWhatsAppMessage, sendSMSMessage } from "../lib/twilio.js";
 import {
   getBookingById,
   getBookings,
@@ -83,6 +84,23 @@ bookingsRouter.post("/", bookingLimiter, async (req, res) => {
       updatedAt: now,
       userId,
     });
+    // Dispatch notifications asynchronously to not block the API response
+    const materialsStr = parsed.data.materials.join(", ");
+    const addressStr = parsed.data.tower ? `${parsed.data.tower}, ${parsed.data.society}` : parsed.data.society;
+    const messageBody = `Hello ${parsed.data.fullName},\n\nThank you for choosing The Scrap Co.! Your pickup has been scheduled successfully:\n📅 Date: ${parsed.data.pickupDate}\n📍 Address: ${addressStr}\n📦 Items: ${materialsStr}\n\nOur representative will contact you on this number (${parsed.data.phone}) prior to arrival. Have a great day!`;
+
+    sendWhatsAppMessage(parsed.data.phone, messageBody).then((waResult) => {
+      console.log(`[Booking WA Notification] Dispatch: ${waResult.success ? "success" : "failed"}, ID: ${waResult.messageId || "none"}`);
+    }).catch((err) => {
+      console.error("[Booking WA Notification] Async Error:", err);
+    });
+
+    sendSMSMessage(parsed.data.phone, messageBody).then((smsResult) => {
+      console.log(`[Booking SMS Notification] Dispatch: ${smsResult.success ? "success" : "failed"}, ID: ${smsResult.messageId || "none"}`);
+    }).catch((err) => {
+      console.error("[Booking SMS Notification] Async Error:", err);
+    });
+
     return res.status(201).json({
       message: "Pickup scheduled. WhatsApp confirmation will follow shortly.",
       booking,
