@@ -1,10 +1,10 @@
 import twilio from "twilio";
 
-const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const authToken = process.env.TWILIO_AUTH_TOKEN;
-const whatsappFrom = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
-const smsFrom = process.env.TWILIO_SMS_FROM;
-const provider = process.env.WHATSAPP_PROVIDER || "mock";
+const accountSid = process.env.TWILIO_ACCOUNT_SID?.trim();
+const authToken = process.env.TWILIO_AUTH_TOKEN?.trim();
+const whatsappFrom = (process.env.TWILIO_WHATSAPP_FROM || "").split("#")[0].trim() || "whatsapp:+14155238886";
+const smsFrom = (process.env.TWILIO_SMS_FROM || "").split("#")[0].trim() || undefined;
+const provider = process.env.WHATSAPP_PROVIDER?.trim() || "mock";
 
 // Initialize Twilio client only if credentials are provided and provider is set to 'twilio'
 let client: twilio.Twilio | null = null;
