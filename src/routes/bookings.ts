@@ -101,6 +101,16 @@ bookingsRouter.post("/", bookingLimiter, async (req, res) => {
       console.error("[Booking SMS Notification] Async Error:", err);
     });
 
+    const adminPhone = process.env.TWILIO_ADMIN_PHONE;
+    if (adminPhone) {
+      const adminMessage = `🔔 *New Pickup Scheduled!*\n\n👤 *Customer*: ${parsed.data.fullName}\n📞 *Phone*: ${parsed.data.phone}\n📅 *Date*: ${parsed.data.pickupDate}\n📍 *Address*: ${addressStr}\n📦 *Materials*: ${materialsStr}`;
+      sendWhatsAppMessage(adminPhone, adminMessage).then((adminResult) => {
+        console.log(`[Admin WA Notification] Dispatch: ${adminResult.success ? "success" : "failed"}, ID: ${adminResult.messageId || "none"}`);
+      }).catch((err) => {
+        console.error("[Admin WA Notification] Async Error:", err);
+      });
+    }
+
     return res.status(201).json({
       message: "Pickup scheduled. WhatsApp confirmation will follow shortly.",
       booking,
