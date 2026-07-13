@@ -25,6 +25,8 @@ const materialSchema = z.object({
 const supplierSchema = z.object({
   name: z.string().trim().min(1).max(150),
   phone: z.string().trim().optional().nullable(),
+  whatsapp: z.string().trim().optional().nullable(),
+  upi: z.string().trim().optional().nullable(),
   email: z.string().trim().email().or(z.literal("")).optional().nullable(),
   address: z.string().trim().optional().nullable(),
   id_type: z.string().trim().optional().nullable(),
@@ -247,7 +249,7 @@ erpRouter.get("/suppliers", async (req, res) => {
     let queryBuilder = supabase.from("erp_suppliers").select("*").eq("is_active", true);
 
     if (search) {
-      queryBuilder = queryBuilder.or(`name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%`);
+      queryBuilder = queryBuilder.or(`name.ilike.%${search}%,phone.ilike.%${search}%,whatsapp.ilike.%${search}%,upi.ilike.%${search}%,email.ilike.%${search}%`);
     }
 
     const { data: suppliers, error } = await queryBuilder.order("name");
@@ -331,6 +333,8 @@ erpRouter.post("/suppliers", async (req, res) => {
       .insert({
         name: parsed.data.name,
         phone: parsed.data.phone || null,
+        whatsapp: parsed.data.whatsapp || null,
+        upi: parsed.data.upi || null,
         email: parsed.data.email || null,
         address: parsed.data.address || null,
         id_type: parsed.data.id_type || null,

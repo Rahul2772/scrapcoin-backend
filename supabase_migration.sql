@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS erp_suppliers (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name         VARCHAR(150) NOT NULL,
   phone        VARCHAR(20),
+  whatsapp     VARCHAR(20),
+  upi          VARCHAR(20),
   email        VARCHAR(150),
   address      TEXT,
   id_type      VARCHAR(30),
@@ -146,4 +148,8 @@ ALTER TABLE erp_customers ADD COLUMN IF NOT EXISTS upi VARCHAR(20);
 -- Migration: Remove category CHECK constraint from erp_materials to support custom categories
 ALTER TABLE erp_materials DROP CONSTRAINT IF EXISTS erp_materials_category_check;
 ALTER TABLE erp_materials ALTER COLUMN category TYPE VARCHAR(50);
+
+-- Migration: Add additional contact fields (whatsapp and upi) to B2B Suppliers
+ALTER TABLE erp_suppliers ADD COLUMN IF NOT EXISTS whatsapp VARCHAR(20);
+ALTER TABLE erp_suppliers ADD COLUMN IF NOT EXISTS upi VARCHAR(20);
 
