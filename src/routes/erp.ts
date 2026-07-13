@@ -13,7 +13,7 @@ erpRouter.use(requireAdminOrChampion);
 
 const materialSchema = z.object({
   name: z.string().trim().min(1).max(100),
-  category: z.enum(["Ferrous", "Non-Ferrous"]),
+  category: z.string().trim().min(1).max(50),
   unit: z.string().trim().default("kg"),
   buy_price: z.number().nonnegative(),
   sell_price: z.number().nonnegative(),

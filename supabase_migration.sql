@@ -8,7 +8,7 @@
 CREATE TABLE IF NOT EXISTS erp_materials (
   id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name          VARCHAR(100) UNIQUE NOT NULL,
-  category      VARCHAR(30) NOT NULL CHECK (category IN ('Ferrous', 'Non-Ferrous')),
+  category      VARCHAR(50) NOT NULL,
   unit          VARCHAR(10) NOT NULL DEFAULT 'kg',
   buy_price     NUMERIC(12,2) NOT NULL DEFAULT 0,
   sell_price    NUMERIC(12,2) NOT NULL DEFAULT 0,
@@ -142,4 +142,8 @@ CREATE INDEX IF NOT EXISTS idx_erp_whatsapp_logs_txn      ON erp_whatsapp_logs(t
 -- Migration: Add additional contact fields (whatsapp and upi) to B2C Customers
 ALTER TABLE erp_customers ADD COLUMN IF NOT EXISTS whatsapp VARCHAR(20);
 ALTER TABLE erp_customers ADD COLUMN IF NOT EXISTS upi VARCHAR(20);
+
+-- Migration: Remove category CHECK constraint from erp_materials to support custom categories
+ALTER TABLE erp_materials DROP CONSTRAINT IF EXISTS erp_materials_category_check;
+ALTER TABLE erp_materials ALTER COLUMN category TYPE VARCHAR(50);
 
