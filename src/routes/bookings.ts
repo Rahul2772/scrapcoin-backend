@@ -11,6 +11,7 @@ import {
   getBookings,
   saveBooking,
   updateBooking,
+  deleteBooking,
 } from "../db/store.js";
 
 const bookingLimiter = rateLimit({
@@ -185,5 +186,21 @@ bookingsRouter.patch("/:id", requireAdminOrChampion, async (req, res) => {
   } catch (err) {
     console.error("PATCH /api/bookings/:id error:", err);
     return res.status(500).json({ error: "Failed to update booking" });
+  }
+});
+
+// DELETE /api/bookings/:id — delete a booking permanently (admin only)
+bookingsRouter.delete("/:id", requireAdmin, async (req, res) => {
+  try {
+    const booking = await getBookingById(String(req.params.id));
+    if (!booking) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
+
+    await deleteBooking(String(req.params.id));
+    return res.json({ success: true, message: "Booking permanently deleted" });
+  } catch (err) {
+    console.error("DELETE /api/bookings/:id error:", err);
+    return res.status(500).json({ error: "Failed to delete booking" });
   }
 });

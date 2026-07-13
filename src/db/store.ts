@@ -168,6 +168,11 @@ export async function updateBooking(
   return rowToBooking(data);
 }
 
+export async function deleteBooking(id: string): Promise<void> {
+  const { error } = await supabase.from("bookings").delete().eq("id", id);
+  if (error) throw new Error(error.message);
+}
+
 // ── Helper ────────────────────────────────────────────────
 
 function rowToBooking(r: Record<string, unknown>): Booking {
