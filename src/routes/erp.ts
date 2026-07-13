@@ -34,6 +34,8 @@ const supplierSchema = z.object({
 const customerSchema = z.object({
   name: z.string().trim().min(1).max(255),
   phone: z.string().trim().optional().nullable(),
+  whatsapp: z.string().trim().optional().nullable(),
+  upi: z.string().trim().optional().nullable(),
   address: z.string().trim().optional().nullable(),
   id_type: z.string().trim().optional().nullable(),
   id_number: z.string().trim().optional().nullable(),
@@ -397,7 +399,7 @@ erpRouter.get("/customers", async (req, res) => {
     let queryBuilder = supabase.from("erp_customers").select("*").eq("is_active", true);
 
     if (search) {
-      queryBuilder = queryBuilder.or(`name.ilike.%${search}%,phone.ilike.%${search}%`);
+      queryBuilder = queryBuilder.or(`name.ilike.%${search}%,phone.ilike.%${search}%,whatsapp.ilike.%${search}%,upi.ilike.%${search}%`);
     }
 
     const { data: customers, error } = await queryBuilder
@@ -478,6 +480,8 @@ erpRouter.post("/customers", async (req, res) => {
       .insert({
         name: parsed.data.name,
         phone: parsed.data.phone || null,
+        whatsapp: parsed.data.whatsapp || null,
+        upi: parsed.data.upi || null,
         address: parsed.data.address || null,
         id_type: parsed.data.id_type || "Aadhaar",
         id_number: parsed.data.id_number || null,

@@ -138,3 +138,8 @@ CREATE INDEX IF NOT EXISTS idx_erp_invoices_transaction   ON erp_invoices(transa
 CREATE INDEX IF NOT EXISTS idx_erp_price_history_material ON erp_price_history(material_id);
 CREATE INDEX IF NOT EXISTS idx_erp_purchase_receipts_cust ON erp_purchase_receipts(customer_id);
 CREATE INDEX IF NOT EXISTS idx_erp_whatsapp_logs_txn      ON erp_whatsapp_logs(transaction_id);
+
+-- Migration: Add additional contact fields (whatsapp and upi) to B2C Customers
+ALTER TABLE erp_customers ADD COLUMN IF NOT EXISTS whatsapp VARCHAR(20);
+ALTER TABLE erp_customers ADD COLUMN IF NOT EXISTS upi VARCHAR(20);
+
