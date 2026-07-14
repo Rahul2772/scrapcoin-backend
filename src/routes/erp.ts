@@ -49,6 +49,7 @@ const transactionSchema = z.object({
   notes: z.string().trim().optional().nullable(),
   due_date: z.string().optional().nullable(),
   payment_method: z.string().optional().nullable(),
+  created_at: z.string().trim().optional().nullable(),
   // Single entry fallback
   material_id: z.string().uuid().optional(),
   weight: z.number().positive().optional(),
@@ -688,7 +689,7 @@ erpRouter.post("/transactions", async (req, res) => {
     return res.status(422).json({ success: false, errors: parsed.error.flatten() });
   }
 
-  const { supplier_id, notes, due_date, payment_method, items } = parsed.data;
+  const { supplier_id, notes, due_date, payment_method, items, created_at } = parsed.data;
 
   try {
     let itemsToInsert: Array<{ material_id: string; weight: number; price_per_unit: number; gst_rate: number }> = [];
@@ -739,22 +740,27 @@ erpRouter.post("/transactions", async (req, res) => {
       const txn_number = itemsToInsert.length > 1 ? `${baseTxnNum}/${i + 1}` : baseTxnNum;
 
       // Create transaction
+      const txnPayload: any = {
+        txn_number,
+        supplier_id,
+        material_id: item.material_id,
+        weight: item.weight,
+        unit: material.unit,
+        price_per_unit: item.price_per_unit,
+        subtotal,
+        gst_rate: item.gst_rate,
+        gst_amount,
+        total_amount,
+        notes,
+        created_by: req.privilegedUser?.id,
+      };
+      if (created_at) {
+        txnPayload.created_at = created_at;
+      }
+
       const { data: txn, error: insertErr } = await supabase
         .from("erp_transactions")
-        .insert({
-          txn_number,
-          supplier_id,
-          material_id: item.material_id,
-          weight: item.weight,
-          unit: material.unit,
-          price_per_unit: item.price_per_unit,
-          subtotal,
-          gst_rate: item.gst_rate,
-          gst_amount,
-          total_amount,
-          notes,
-          created_by: req.privilegedUser?.id,
-        })
+        .insert(txnPayload)
         .select()
         .single();
 
@@ -772,18 +778,23 @@ erpRouter.post("/transactions", async (req, res) => {
       const invoice_number = itemsToInsert.length > 1 ? `${baseInvNum}/${i + 1}` : baseInvNum;
 
       // Auto-create invoice
+      const invPayload: any = {
+        invoice_number,
+        transaction_id: txn.id,
+        supplier_id,
+        amount: total_amount,
+        due_date: due_date || null,
+        payment_method: payment_method || null,
+        status: payment_method ? "paid" : "pending",
+        paid_at: payment_method ? (created_at || new Date().toISOString()) : null,
+      };
+      if (created_at) {
+        invPayload.created_at = created_at;
+      }
+
       const { data: invoice, error: invoiceErr } = await supabase
         .from("erp_invoices")
-        .insert({
-          invoice_number,
-          transaction_id: txn.id,
-          supplier_id,
-          amount: total_amount,
-          due_date: due_date || null,
-          payment_method: payment_method || null,
-          status: payment_method ? "paid" : "pending",
-          paid_at: payment_method ? new Date().toISOString() : null,
-        })
+        .insert(invPayload)
         .select()
         .single();
 
@@ -807,6 +818,191 @@ erpRouter.post("/transactions", async (req, res) => {
     });
   } catch (err: any) {
     console.error("POST /api/erp/transactions error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// PUT /api/erp/transactions/:id — Edit B2B scale transaction ticket
+erpRouter.put("/transactions/:id", async (req, res) => {
+  const parsed = transactionSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(422).json({ success: false, errors: parsed.error.flatten() });
+  }
+
+  const txnId = req.params.id;
+  const { supplier_id, notes, due_date, payment_method, items, created_at } = parsed.data;
+
+  try {
+    // 1. Fetch old transaction
+    const { data: oldTxn, error: fetchErr } = await supabase
+      .from("erp_transactions")
+      .select("*")
+      .eq("id", txnId)
+      .single();
+
+    if (fetchErr || !oldTxn) {
+      return res.status(404).json({ success: false, message: "Transaction not found" });
+    }
+
+    const baseTxnNum = oldTxn.txn_number.split("/")[0];
+
+    // Find all siblings
+    const { data: siblings, error: sibErr } = await supabase
+      .from("erp_transactions")
+      .select("*")
+      .or(`txn_number.eq.${baseTxnNum},txn_number.like.${baseTxnNum}/%`);
+
+    if (sibErr) throw sibErr;
+
+    // 2. Revert stock, delete invoices and transaction rows for each sibling
+    const oldSiblings = siblings || [];
+    for (const sib of oldSiblings) {
+      // Revert stock
+      const { data: material } = await supabase
+        .from("erp_materials")
+        .select("stock_qty")
+        .eq("id", sib.material_id)
+        .single();
+      if (material) {
+        await supabase
+          .from("erp_materials")
+          .update({
+            stock_qty: Math.max(0, Number(material.stock_qty) - Number(sib.weight)),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", sib.material_id);
+      }
+
+      // Delete invoice
+      await supabase.from("erp_invoices").delete().eq("transaction_id", sib.id);
+
+      // Delete transaction row
+      await supabase.from("erp_transactions").delete().eq("id", sib.id);
+    }
+
+    // 3. Normalize new items
+    let itemsToInsert: Array<{ material_id: string; weight: number; price_per_unit: number; gst_rate: number }> = [];
+
+    if (items && items.length > 0) {
+      itemsToInsert = items;
+    } else {
+      if (!parsed.data.material_id || !parsed.data.weight || parsed.data.price_per_unit === undefined) {
+        return res.status(422).json({ success: false, message: "Either items or material_id, weight and price_per_unit are required." });
+      }
+      itemsToInsert = [{
+        material_id: parsed.data.material_id,
+        weight: parsed.data.weight,
+        price_per_unit: parsed.data.price_per_unit,
+        gst_rate: parsed.data.gst_rate ?? 0
+      }];
+    }
+
+    // 4. Verify supplier exists
+    const { data: supplier, error: sErr } = await supabase.from("erp_suppliers").select("id, name").eq("id", supplier_id).eq("is_active", true).single();
+    if (sErr || !supplier) return res.status(404).json({ success: false, message: "Supplier not found or inactive." });
+
+    // 5. Generate sequential base invoice_number prefix
+    const { count: invCount, error: invCountErr } = await supabase.from("erp_invoices").select("*", { count: "exact", head: true });
+    if (invCountErr) throw invCountErr;
+    const baseInvNum = `INV-${String((invCount || 0) + 1).padStart(5, "0")}`;
+
+    let firstTxn: any = null;
+    let firstInvoice: any = null;
+
+    // 6. Loop insert B2B items under baseTxnNum
+    for (let i = 0; i < itemsToInsert.length; i++) {
+      const item = itemsToInsert[i];
+
+      // Verify material exists
+      const { data: material, error: mErr } = await supabase.from("erp_materials").select("id, name, unit, stock_qty").eq("id", item.material_id).eq("is_active", true).single();
+      if (mErr || !material) return res.status(404).json({ success: false, message: `Material not found or inactive: ${item.material_id}` });
+
+      const subtotal = Number((item.weight * item.price_per_unit).toFixed(2));
+      const gst_amount = Number(((subtotal * item.gst_rate) / 100).toFixed(2));
+      const total_amount = Number((subtotal + gst_amount).toFixed(2));
+
+      const txn_number = itemsToInsert.length > 1 ? `${baseTxnNum}/${i + 1}` : baseTxnNum;
+
+      // Create transaction row
+      const txnPayload: any = {
+        txn_number,
+        supplier_id,
+        material_id: item.material_id,
+        weight: item.weight,
+        unit: material.unit,
+        price_per_unit: item.price_per_unit,
+        subtotal,
+        gst_rate: item.gst_rate,
+        gst_amount,
+        total_amount,
+        notes,
+        created_by: req.privilegedUser?.id,
+        updated_at: new Date().toISOString(),
+      };
+      if (created_at) {
+        txnPayload.created_at = created_at;
+      }
+
+      const { data: txn, error: insertErr } = await supabase
+        .from("erp_transactions")
+        .insert(txnPayload)
+        .select()
+        .single();
+
+      if (insertErr) throw insertErr;
+
+      // Add to material stock
+      await supabase
+        .from("erp_materials")
+        .update({
+          stock_qty: Number(material.stock_qty) + item.weight,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", item.material_id);
+
+      const invoice_number = itemsToInsert.length > 1 ? `${baseInvNum}/${i + 1}` : baseInvNum;
+
+      // Auto-create invoice
+      const invPayload: any = {
+        invoice_number,
+        transaction_id: txn.id,
+        supplier_id,
+        amount: total_amount,
+        due_date: due_date || null,
+        payment_method: payment_method || null,
+        status: payment_method ? "paid" : "pending",
+        paid_at: payment_method ? (created_at || new Date().toISOString()) : null,
+        updated_at: new Date().toISOString(),
+      };
+      if (created_at) {
+        invPayload.created_at = created_at;
+      }
+
+      const { data: invoice, error: invoiceErr } = await supabase
+        .from("erp_invoices")
+        .insert(invPayload)
+        .select()
+        .single();
+
+      if (invoiceErr) throw invoiceErr;
+
+      if (i === 0) {
+        firstTxn = {
+          ...txn,
+          material_name: material.name,
+          supplier_name: supplier.name,
+        };
+        firstInvoice = invoice;
+      }
+    }
+
+    res.json({
+      success: true,
+      message: "Scale transaction(s) and invoice(s) updated successfully.",
+      transaction: firstTxn,
+      invoice: firstInvoice,
+    });
+  } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
