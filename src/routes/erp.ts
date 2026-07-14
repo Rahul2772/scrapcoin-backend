@@ -46,23 +46,38 @@ const customerSchema = z.object({
 
 const transactionSchema = z.object({
   supplier_id: z.string().uuid(),
-  material_id: z.string().uuid(),
-  weight: z.number().positive(),
-  price_per_unit: z.number().nonnegative(),
-  gst_rate: z.number().min(0).max(100).optional().default(0),
   notes: z.string().trim().optional().nullable(),
   due_date: z.string().optional().nullable(),
   payment_method: z.string().optional().nullable(),
+  // Single entry fallback
+  material_id: z.string().uuid().optional(),
+  weight: z.number().positive().optional(),
+  price_per_unit: z.number().nonnegative().optional(),
+  gst_rate: z.number().min(0).max(100).optional().default(0),
+  // Multi entry
+  items: z.array(z.object({
+    material_id: z.string().uuid(),
+    weight: z.number().positive(),
+    price_per_unit: z.number().nonnegative(),
+    gst_rate: z.number().min(0).max(100).optional().default(0),
+  })).optional(),
 });
 
 const purchaseReceiptSchema = z.object({
   customer_id: z.string().uuid().optional().nullable(),
-  material_id: z.string().uuid(),
-  weight: z.number().positive(),
-  price_per_unit: z.number().nonnegative(),
   payment_method: z.string().optional().default("cash"),
   notes: z.string().trim().optional().nullable(),
   created_at: z.string().trim().optional().nullable(),
+  // Single entry fallback
+  material_id: z.string().uuid().optional(),
+  weight: z.number().positive().optional(),
+  price_per_unit: z.number().nonnegative().optional(),
+  // Multi entry
+  items: z.array(z.object({
+    material_id: z.string().uuid(),
+    weight: z.number().positive(),
+    price_per_unit: z.number().nonnegative(),
+  })).optional(),
 });
 
 const payInvoiceSchema = z.object({
@@ -673,89 +688,122 @@ erpRouter.post("/transactions", async (req, res) => {
     return res.status(422).json({ success: false, errors: parsed.error.flatten() });
   }
 
-  const { supplier_id, material_id, weight, price_per_unit, gst_rate, notes, due_date, payment_method } = parsed.data;
+  const { supplier_id, notes, due_date, payment_method, items } = parsed.data;
 
   try {
-    // 1. Verify supplier & material exist
+    let itemsToInsert: Array<{ material_id: string; weight: number; price_per_unit: number; gst_rate: number }> = [];
+
+    if (items && items.length > 0) {
+      itemsToInsert = items;
+    } else {
+      if (!parsed.data.material_id || !parsed.data.weight || parsed.data.price_per_unit === undefined) {
+        return res.status(422).json({ success: false, message: "Either items or material_id, weight and price_per_unit are required." });
+      }
+      itemsToInsert = [{
+        material_id: parsed.data.material_id,
+        weight: parsed.data.weight,
+        price_per_unit: parsed.data.price_per_unit,
+        gst_rate: parsed.data.gst_rate ?? 0
+      }];
+    }
+
+    // 1. Verify supplier exists
     const { data: supplier, error: sErr } = await supabase.from("erp_suppliers").select("id, name").eq("id", supplier_id).eq("is_active", true).single();
-    const { data: material, error: mErr } = await supabase.from("erp_materials").select("id, name, unit, stock_qty").eq("id", material_id).eq("is_active", true).single();
-
     if (sErr || !supplier) return res.status(404).json({ success: false, message: "Supplier not found or inactive." });
-    if (mErr || !material) return res.status(404).json({ success: false, message: "Material not found or inactive." });
 
-    // 2. Calculations
-    const subtotal = Number((weight * price_per_unit).toFixed(2));
-    const gst_amount = Number(((subtotal * gst_rate) / 100).toFixed(2));
-    const total_amount = Number((subtotal + gst_amount).toFixed(2));
-
-    // 3. Generate sequential txn_number
+    // 2. Generate sequential base txn_number
     const { count: txnCount, error: countErr } = await supabase.from("erp_transactions").select("*", { count: "exact", head: true });
     if (countErr) throw countErr;
-    const txn_number = `TXN-${String((txnCount || 0) + 1).padStart(5, "0")}`;
+    const baseTxnNum = `TXN-${String((txnCount || 0) + 1).padStart(5, "0")}`;
 
-    // 4. Create Transaction
-    const { data: txn, error: insertErr } = await supabase
-      .from("erp_transactions")
-      .insert({
-        txn_number,
-        supplier_id,
-        material_id,
-        weight,
-        unit: material.unit,
-        price_per_unit,
-        subtotal,
-        gst_rate,
-        gst_amount,
-        total_amount,
-        notes,
-        created_by: req.privilegedUser?.id,
-      })
-      .select()
-      .single();
-
-    if (insertErr) throw insertErr;
-
-    // 5. Update material stock (B2B Buy means we increase our inventory)
-    await supabase
-      .from("erp_materials")
-      .update({
-        stock_qty: Number(material.stock_qty) + weight,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", material_id);
-
-    // 6. Generate sequential invoice_number
+    // 3. Generate sequential base invoice_number
     const { count: invCount, error: invCountErr } = await supabase.from("erp_invoices").select("*", { count: "exact", head: true });
     if (invCountErr) throw invCountErr;
-    const invoice_number = `INV-${String((invCount || 0) + 1).padStart(5, "0")}`;
+    const baseInvNum = `INV-${String((invCount || 0) + 1).padStart(5, "0")}`;
 
-    // 7. Auto-create Invoice
-    const { data: invoice, error: invoiceErr } = await supabase
-      .from("erp_invoices")
-      .insert({
-        invoice_number,
-        transaction_id: txn.id,
-        supplier_id,
-        amount: total_amount,
-        due_date: due_date || null,
-        payment_method: payment_method || null,
-        status: payment_method ? "paid" : "pending",
-        paid_at: payment_method ? new Date().toISOString() : null,
-      })
-      .select()
-      .single();
+    let firstTxn: any = null;
+    let firstInvoice: any = null;
 
-    if (invoiceErr) throw invoiceErr;
+    // 4. Loop insert B2B items
+    for (let i = 0; i < itemsToInsert.length; i++) {
+      const item = itemsToInsert[i];
+
+      // Verify material exists
+      const { data: material, error: mErr } = await supabase.from("erp_materials").select("id, name, unit, stock_qty").eq("id", item.material_id).eq("is_active", true).single();
+      if (mErr || !material) return res.status(404).json({ success: false, message: `Material not found or inactive: ${item.material_id}` });
+
+      const subtotal = Number((item.weight * item.price_per_unit).toFixed(2));
+      const gst_amount = Number(((subtotal * item.gst_rate) / 100).toFixed(2));
+      const total_amount = Number((subtotal + gst_amount).toFixed(2));
+
+      const txn_number = itemsToInsert.length > 1 ? `${baseTxnNum}/${i + 1}` : baseTxnNum;
+
+      // Create transaction
+      const { data: txn, error: insertErr } = await supabase
+        .from("erp_transactions")
+        .insert({
+          txn_number,
+          supplier_id,
+          material_id: item.material_id,
+          weight: item.weight,
+          unit: material.unit,
+          price_per_unit: item.price_per_unit,
+          subtotal,
+          gst_rate: item.gst_rate,
+          gst_amount,
+          total_amount,
+          notes,
+          created_by: req.privilegedUser?.id,
+        })
+        .select()
+        .single();
+
+      if (insertErr) throw insertErr;
+
+      // Update material stock
+      await supabase
+        .from("erp_materials")
+        .update({
+          stock_qty: Number(material.stock_qty) + item.weight,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", item.material_id);
+
+      const invoice_number = itemsToInsert.length > 1 ? `${baseInvNum}/${i + 1}` : baseInvNum;
+
+      // Auto-create invoice
+      const { data: invoice, error: invoiceErr } = await supabase
+        .from("erp_invoices")
+        .insert({
+          invoice_number,
+          transaction_id: txn.id,
+          supplier_id,
+          amount: total_amount,
+          due_date: due_date || null,
+          payment_method: payment_method || null,
+          status: payment_method ? "paid" : "pending",
+          paid_at: payment_method ? new Date().toISOString() : null,
+        })
+        .select()
+        .single();
+
+      if (invoiceErr) throw invoiceErr;
+
+      if (i === 0) {
+        firstTxn = {
+          ...txn,
+          material_name: material.name,
+          supplier_name: supplier.name,
+        };
+        firstInvoice = invoice;
+      }
+    }
 
     res.status(201).json({
       success: true,
-      message: "Transaction recorded and invoice created.",
-      transaction: {
-        ...txn,
-        material_name: material.name,
-        supplier_name: supplier.name,
-      },
-      invoice,
+      message: "Scale transaction(s) recorded and invoice(s) created.",
+      transaction: firstTxn,
+      invoice: firstInvoice,
     });
   } catch (err: any) {
     console.error("POST /api/erp/transactions error:", err);
@@ -1062,70 +1110,103 @@ erpRouter.post("/purchase-receipts", async (req, res) => {
     return res.status(422).json({ success: false, errors: parsed.error.flatten() });
   }
 
-    const { customer_id, material_id, weight, price_per_unit, payment_method, notes, created_at } = parsed.data;
+  const { customer_id, payment_method, notes, created_at, items } = parsed.data;
 
   try {
-    // 1. Verify material exists
-    const { data: material, error: mErr } = await supabase.from("erp_materials").select("id, name, unit, stock_qty").eq("id", material_id).single();
-    if (mErr || !material) return res.status(404).json({ success: false, message: "Material not found." });
+    let itemsToInsert: Array<{ material_id: string; weight: number; price_per_unit: number }> = [];
 
-    const total_amount = Number((weight * price_per_unit).toFixed(2));
-
-    // 2. Generate sequential receipt number (simulating sequences)
-    const { count: receiptCount, error: rCountErr } = await supabase.from("erp_purchase_receipts").select("*", { count: "exact", head: true });
-    if (rCountErr) throw rCountErr;
-    const receipt_number = `RCP-${String((receiptCount || 0) + 1001)}`;
-
-    // 3. Insert receipt
-    const insertPayload: any = {
-      receipt_number,
-      customer_id: customer_id || null,
-      material_id,
-      weight,
-      unit: material.unit,
-      price_per_unit,
-      total_amount,
-      payment_method,
-      notes: notes || null,
-      created_by: req.privilegedUser?.id,
-    };
-    if (created_at) {
-      insertPayload.created_at = created_at;
+    if (items && items.length > 0) {
+      itemsToInsert = items;
+    } else {
+      if (!parsed.data.material_id || !parsed.data.weight || parsed.data.price_per_unit === undefined) {
+        return res.status(422).json({ success: false, message: "Either items or material_id, weight and price_per_unit are required." });
+      }
+      itemsToInsert = [{
+        material_id: parsed.data.material_id,
+        weight: parsed.data.weight,
+        price_per_unit: parsed.data.price_per_unit
+      }];
     }
 
-    const { data: receipt, error: insertErr } = await supabase
-      .from("erp_purchase_receipts")
-      .insert(insertPayload)
-      .select()
-      .single();
+    // 1. Generate sequential base receipt number (simulating sequences)
+    const { count: receiptCount, error: rCountErr } = await supabase.from("erp_purchase_receipts").select("*", { count: "exact", head: true });
+    if (rCountErr) throw rCountErr;
+    const baseReceiptNum = `RCP-${String((receiptCount || 0) + 1001)}`;
 
-    if (insertErr) throw insertErr;
+    let cumulativeTotal = 0;
+    let firstReceipt: any = null;
 
-    // 4. Update material stock (household buy means we collect items, increasing stock)
-    await supabase
-      .from("erp_materials")
-      .update({
-        stock_qty: Number(material.stock_qty) + weight,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", material_id);
+    // 2. Loop insert each item
+    for (let i = 0; i < itemsToInsert.length; i++) {
+      const item = itemsToInsert[i];
 
-    // 5. Update customer stats if customer provided
-    if (customer_id) {
+      // Verify material exists
+      const { data: material, error: mErr } = await supabase
+        .from("erp_materials")
+        .select("id, name, unit, stock_qty")
+        .eq("id", item.material_id)
+        .single();
+      if (mErr || !material) return res.status(404).json({ success: false, message: `Material not found for ID: ${item.material_id}` });
+
+      const total_amount = Number((item.weight * item.price_per_unit).toFixed(2));
+      cumulativeTotal += total_amount;
+
+      const receipt_number = itemsToInsert.length > 1 ? `${baseReceiptNum}/${i + 1}` : baseReceiptNum;
+
+      const insertPayload: any = {
+        receipt_number,
+        customer_id: customer_id || null,
+        material_id: item.material_id,
+        weight: item.weight,
+        unit: material.unit,
+        price_per_unit: item.price_per_unit,
+        total_amount,
+        payment_method,
+        notes: notes || null,
+        created_by: req.privilegedUser?.id,
+      };
+      if (created_at) {
+        insertPayload.created_at = created_at;
+      }
+
+      const { data: receipt, error: insertErr } = await supabase
+        .from("erp_purchase_receipts")
+        .insert(insertPayload)
+        .select()
+        .single();
+
+      if (insertErr) throw insertErr;
+
+      // Update material stock
+      await supabase
+        .from("erp_materials")
+        .update({
+          stock_qty: Number(material.stock_qty) + item.weight,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", item.material_id);
+
+      if (i === 0) {
+        firstReceipt = receipt;
+      }
+    }
+
+    // 3. Update customer stats if customer provided
+    if (customer_id && cumulativeTotal > 0) {
       const { data: customer } = await supabase.from("erp_customers").select("total_visits, total_paid").eq("id", customer_id).single();
       if (customer) {
         await supabase
           .from("erp_customers")
           .update({
             total_visits: (customer.total_visits || 0) + 1,
-            total_paid: Number(customer.total_paid || 0) + total_amount,
+            total_paid: Number(customer.total_paid || 0) + cumulativeTotal,
             updated_at: new Date().toISOString(),
           })
           .eq("id", customer_id);
       }
     }
 
-    // 6. Fetch fully formatted receipt to return
+    // 4. Fetch fully formatted first receipt to return
     const { data: fullReceipt, error: getFullErr } = await supabase
       .from("erp_purchase_receipts")
       .select(`
@@ -1133,7 +1214,7 @@ erpRouter.post("/purchase-receipts", async (req, res) => {
         erp_customers(name, phone),
         erp_materials(name, unit)
       `)
-      .eq("id", receipt.id)
+      .eq("id", firstReceipt.id)
       .single();
 
     if (getFullErr) throw getFullErr;
@@ -1160,7 +1241,7 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
   }
 
   const receiptId = req.params.id;
-  const { customer_id, material_id, weight, price_per_unit, payment_method, notes, created_at } = parsed.data;
+  const { customer_id, payment_method, notes, created_at, items } = parsed.data;
 
   try {
     // 1. Fetch old receipt details
@@ -1174,144 +1255,157 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
       return res.status(404).json({ success: false, message: "Receipt not found" });
     }
 
-    // 2. Fetch new material details to check unit
-    const { data: newMaterial, error: matErr } = await supabase
-      .from("erp_materials")
-      .select("id, name, unit, stock_qty")
-      .eq("id", material_id)
-      .single();
+    const baseReceiptNum = oldReceipt.receipt_number.split("/")[0];
 
-    if (matErr || !newMaterial) {
-      return res.status(404).json({ success: false, message: "New material not found" });
-    }
+    // Find all siblings
+    const { data: siblings, error: sibErr } = await supabase
+      .from("erp_purchase_receipts")
+      .select("*")
+      .or(`receipt_number.eq.${baseReceiptNum},receipt_number.like.${baseReceiptNum}/%`);
 
-    const total_amount = Number((weight * price_per_unit).toFixed(2));
+    if (sibErr) throw sibErr;
 
-    // 3. Update stock_qty on old and new materials
-    if (oldReceipt.material_id === material_id) {
-      // Same material: adjust stock_qty by difference
-      const weightDiff = weight - Number(oldReceipt.weight);
-      await supabase
-        .from("erp_materials")
-        .update({
-          stock_qty: Number(newMaterial.stock_qty) + weightDiff,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", material_id);
-    } else {
-      // Different materials:
-      // Subtract old weight from old material stock
-      const { data: oldMaterial } = await supabase
+    // 2. Revert stock and delete each old sibling
+    const oldSiblings = siblings || [];
+    let oldCumulativeTotal = 0;
+    const oldCustId = oldReceipt.customer_id;
+
+    for (const sib of oldSiblings) {
+      oldCumulativeTotal += Number(sib.total_amount);
+
+      // Revert stock
+      const { data: material } = await supabase
         .from("erp_materials")
         .select("stock_qty")
-        .eq("id", oldReceipt.material_id)
+        .eq("id", sib.material_id)
         .single();
-      if (oldMaterial) {
+      if (material) {
         await supabase
           .from("erp_materials")
           .update({
-            stock_qty: Math.max(0, Number(oldMaterial.stock_qty) - Number(oldReceipt.weight)),
+            stock_qty: Math.max(0, Number(material.stock_qty) - Number(sib.weight)),
             updated_at: new Date().toISOString(),
           })
-          .eq("id", oldReceipt.material_id);
+          .eq("id", sib.material_id);
       }
-      // Add new weight to new material stock
+
+      // Delete old sibling
+      await supabase.from("erp_purchase_receipts").delete().eq("id", sib.id);
+    }
+
+    // Revert old customer paid amount & visit count
+    if (oldCustId && oldCumulativeTotal > 0) {
+      const { data: oldCust } = await supabase
+        .from("erp_customers")
+        .select("total_visits, total_paid")
+        .eq("id", oldCustId)
+        .single();
+      if (oldCust) {
+        await supabase
+          .from("erp_customers")
+          .update({
+            total_visits: Math.max(0, Number(oldCust.total_visits || 0) - 1),
+            total_paid: Math.max(0, Number(oldCust.total_paid || 0) - oldCumulativeTotal),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", oldCustId);
+      }
+    }
+
+    // 3. Normalize new items to insert
+    let itemsToInsert: Array<{ material_id: string; weight: number; price_per_unit: number }> = [];
+
+    if (items && items.length > 0) {
+      itemsToInsert = items;
+    } else {
+      if (!parsed.data.material_id || !parsed.data.weight || parsed.data.price_per_unit === undefined) {
+        return res.status(422).json({ success: false, message: "Either items or material_id, weight and price_per_unit are required." });
+      }
+      itemsToInsert = [{
+        material_id: parsed.data.material_id,
+        weight: parsed.data.weight,
+        price_per_unit: parsed.data.price_per_unit
+      }];
+    }
+
+    let newCumulativeTotal = 0;
+    let firstNewReceipt: any = null;
+
+    // 4. Insert new items under the same baseReceiptNum
+    for (let i = 0; i < itemsToInsert.length; i++) {
+      const item = itemsToInsert[i];
+
+      // Verify new material
+      const { data: material, error: mErr } = await supabase
+        .from("erp_materials")
+        .select("id, name, unit, stock_qty")
+        .eq("id", item.material_id)
+        .single();
+      if (mErr || !material) return res.status(404).json({ success: false, message: `Material not found: ${item.material_id}` });
+
+      const total_amount = Number((item.weight * item.price_per_unit).toFixed(2));
+      newCumulativeTotal += total_amount;
+
+      const receipt_number = itemsToInsert.length > 1 ? `${baseReceiptNum}/${i + 1}` : baseReceiptNum;
+
+      const insertPayload: any = {
+        receipt_number,
+        customer_id: customer_id || null,
+        material_id: item.material_id,
+        weight: item.weight,
+        unit: material.unit,
+        price_per_unit: item.price_per_unit,
+        total_amount,
+        payment_method,
+        notes: notes || null,
+        created_by: req.privilegedUser?.id,
+        updated_at: new Date().toISOString(),
+      };
+      if (created_at) {
+        insertPayload.created_at = created_at;
+      }
+
+      const { data: receipt, error: insertErr } = await supabase
+        .from("erp_purchase_receipts")
+        .insert(insertPayload)
+        .select()
+        .single();
+
+      if (insertErr) throw insertErr;
+
+      // Add weight to stock
       await supabase
         .from("erp_materials")
         .update({
-          stock_qty: Number(newMaterial.stock_qty) + weight,
+          stock_qty: Number(material.stock_qty) + item.weight,
           updated_at: new Date().toISOString(),
         })
-        .eq("id", material_id);
+        .eq("id", item.material_id);
+
+      if (i === 0) {
+        firstNewReceipt = receipt;
+      }
     }
 
-    // 4. Update customer paid/visits figures
-    const oldCustId = oldReceipt.customer_id;
+    // 5. Update new customer stats
     const newCustId = customer_id || null;
-
-    if (oldCustId === newCustId) {
-      // Same customer: adjust paid amount
-      if (newCustId) {
-        const { data: customer } = await supabase
+    if (newCustId && newCumulativeTotal > 0) {
+      const { data: customer } = await supabase
+        .from("erp_customers")
+        .select("total_visits, total_paid")
+        .eq("id", newCustId)
+        .single();
+      if (customer) {
+        await supabase
           .from("erp_customers")
-          .select("total_paid")
-          .eq("id", newCustId)
-          .single();
-        if (customer) {
-          const paidDiff = total_amount - Number(oldReceipt.total_amount);
-          await supabase
-            .from("erp_customers")
-            .update({
-              total_paid: Math.max(0, Number(customer.total_paid || 0) + paidDiff),
-              updated_at: new Date().toISOString(),
-            })
-            .eq("id", newCustId);
-        }
-      }
-    } else {
-      // Different customers:
-      // Revert old customer paid amount & visit count
-      if (oldCustId) {
-        const { data: oldCust } = await supabase
-          .from("erp_customers")
-          .select("total_visits, total_paid")
-          .eq("id", oldCustId)
-          .single();
-        if (oldCust) {
-          await supabase
-            .from("erp_customers")
-            .update({
-              total_visits: Math.max(0, Number(oldCust.total_visits || 0) - 1),
-              total_paid: Math.max(0, Number(oldCust.total_paid || 0) - Number(oldReceipt.total_amount)),
-              updated_at: new Date().toISOString(),
-            })
-            .eq("id", oldCustId);
-        }
-      }
-      // Add to new customer paid amount & visit count
-      if (newCustId) {
-        const { data: newCust } = await supabase
-          .from("erp_customers")
-          .select("total_visits, total_paid")
-          .eq("id", newCustId)
-          .single();
-        if (newCust) {
-          await supabase
-            .from("erp_customers")
-            .update({
-              total_visits: (newCust.total_visits || 0) + 1,
-              total_paid: Number(newCust.total_paid || 0) + total_amount,
-              updated_at: new Date().toISOString(),
-            })
-            .eq("id", newCustId);
-        }
+          .update({
+            total_visits: (customer.total_visits || 0) + 1,
+            total_paid: Number(customer.total_paid || 0) + newCumulativeTotal,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", newCustId);
       }
     }
-
-    // 5. Save updated receipt row
-    const updatePayload: any = {
-      customer_id: newCustId,
-      material_id,
-      weight,
-      unit: newMaterial.unit,
-      price_per_unit,
-      total_amount,
-      payment_method,
-      notes: notes || null,
-      updated_at: new Date().toISOString(),
-    };
-    if (created_at) {
-      updatePayload.created_at = created_at;
-    }
-
-    const { data: receipt, error: updateErr } = await supabase
-      .from("erp_purchase_receipts")
-      .update(updatePayload)
-      .eq("id", receiptId)
-      .select()
-      .single();
-
-    if (updateErr) throw updateErr;
 
     // 6. Fetch fully formatted receipt to return
     const { data: fullReceipt, error: getFullErr } = await supabase
@@ -1321,7 +1415,7 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
         erp_customers(name, phone),
         erp_materials(name, unit)
       `)
-      .eq("id", receipt.id)
+      .eq("id", firstNewReceipt.id)
       .single();
 
     if (getFullErr) throw getFullErr;
