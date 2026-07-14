@@ -62,6 +62,7 @@ const purchaseReceiptSchema = z.object({
   price_per_unit: z.number().nonnegative(),
   payment_method: z.string().optional().default("cash"),
   notes: z.string().trim().optional().nullable(),
+  created_at: z.string().trim().optional().nullable(),
 });
 
 const payInvoiceSchema = z.object({
@@ -1061,7 +1062,7 @@ erpRouter.post("/purchase-receipts", async (req, res) => {
     return res.status(422).json({ success: false, errors: parsed.error.flatten() });
   }
 
-  const { customer_id, material_id, weight, price_per_unit, payment_method, notes } = parsed.data;
+    const { customer_id, material_id, weight, price_per_unit, payment_method, notes, created_at } = parsed.data;
 
   try {
     // 1. Verify material exists
@@ -1076,20 +1077,25 @@ erpRouter.post("/purchase-receipts", async (req, res) => {
     const receipt_number = `RCP-${String((receiptCount || 0) + 1001)}`;
 
     // 3. Insert receipt
+    const insertPayload: any = {
+      receipt_number,
+      customer_id: customer_id || null,
+      material_id,
+      weight,
+      unit: material.unit,
+      price_per_unit,
+      total_amount,
+      payment_method,
+      notes: notes || null,
+      created_by: req.privilegedUser?.id,
+    };
+    if (created_at) {
+      insertPayload.created_at = created_at;
+    }
+
     const { data: receipt, error: insertErr } = await supabase
       .from("erp_purchase_receipts")
-      .insert({
-        receipt_number,
-        customer_id: customer_id || null,
-        material_id,
-        weight,
-        unit: material.unit,
-        price_per_unit,
-        total_amount,
-        payment_method,
-        notes: notes || null,
-        created_by: req.privilegedUser?.id,
-      })
+      .insert(insertPayload)
       .select()
       .single();
 
@@ -1141,6 +1147,194 @@ erpRouter.post("/purchase-receipts", async (req, res) => {
     };
 
     res.status(201).json({ success: true, receipt: formatted });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// PUT /api/erp/purchase-receipts/:id — Edit B2C scale collection receipt
+erpRouter.put("/purchase-receipts/:id", async (req, res) => {
+  const parsed = purchaseReceiptSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(422).json({ success: false, errors: parsed.error.flatten() });
+  }
+
+  const receiptId = req.params.id;
+  const { customer_id, material_id, weight, price_per_unit, payment_method, notes, created_at } = parsed.data;
+
+  try {
+    // 1. Fetch old receipt details
+    const { data: oldReceipt, error: fetchErr } = await supabase
+      .from("erp_purchase_receipts")
+      .select("*")
+      .eq("id", receiptId)
+      .single();
+
+    if (fetchErr || !oldReceipt) {
+      return res.status(404).json({ success: false, message: "Receipt not found" });
+    }
+
+    // 2. Fetch new material details to check unit
+    const { data: newMaterial, error: matErr } = await supabase
+      .from("erp_materials")
+      .select("id, name, unit, stock_qty")
+      .eq("id", material_id)
+      .single();
+
+    if (matErr || !newMaterial) {
+      return res.status(404).json({ success: false, message: "New material not found" });
+    }
+
+    const total_amount = Number((weight * price_per_unit).toFixed(2));
+
+    // 3. Update stock_qty on old and new materials
+    if (oldReceipt.material_id === material_id) {
+      // Same material: adjust stock_qty by difference
+      const weightDiff = weight - Number(oldReceipt.weight);
+      await supabase
+        .from("erp_materials")
+        .update({
+          stock_qty: Number(newMaterial.stock_qty) + weightDiff,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", material_id);
+    } else {
+      // Different materials:
+      // Subtract old weight from old material stock
+      const { data: oldMaterial } = await supabase
+        .from("erp_materials")
+        .select("stock_qty")
+        .eq("id", oldReceipt.material_id)
+        .single();
+      if (oldMaterial) {
+        await supabase
+          .from("erp_materials")
+          .update({
+            stock_qty: Math.max(0, Number(oldMaterial.stock_qty) - Number(oldReceipt.weight)),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", oldReceipt.material_id);
+      }
+      // Add new weight to new material stock
+      await supabase
+        .from("erp_materials")
+        .update({
+          stock_qty: Number(newMaterial.stock_qty) + weight,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", material_id);
+    }
+
+    // 4. Update customer paid/visits figures
+    const oldCustId = oldReceipt.customer_id;
+    const newCustId = customer_id || null;
+
+    if (oldCustId === newCustId) {
+      // Same customer: adjust paid amount
+      if (newCustId) {
+        const { data: customer } = await supabase
+          .from("erp_customers")
+          .select("total_paid")
+          .eq("id", newCustId)
+          .single();
+        if (customer) {
+          const paidDiff = total_amount - Number(oldReceipt.total_amount);
+          await supabase
+            .from("erp_customers")
+            .update({
+              total_paid: Math.max(0, Number(customer.total_paid || 0) + paidDiff),
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", newCustId);
+        }
+      }
+    } else {
+      // Different customers:
+      // Revert old customer paid amount & visit count
+      if (oldCustId) {
+        const { data: oldCust } = await supabase
+          .from("erp_customers")
+          .select("total_visits, total_paid")
+          .eq("id", oldCustId)
+          .single();
+        if (oldCust) {
+          await supabase
+            .from("erp_customers")
+            .update({
+              total_visits: Math.max(0, Number(oldCust.total_visits || 0) - 1),
+              total_paid: Math.max(0, Number(oldCust.total_paid || 0) - Number(oldReceipt.total_amount)),
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", oldCustId);
+        }
+      }
+      // Add to new customer paid amount & visit count
+      if (newCustId) {
+        const { data: newCust } = await supabase
+          .from("erp_customers")
+          .select("total_visits, total_paid")
+          .eq("id", newCustId)
+          .single();
+        if (newCust) {
+          await supabase
+            .from("erp_customers")
+            .update({
+              total_visits: (newCust.total_visits || 0) + 1,
+              total_paid: Number(newCust.total_paid || 0) + total_amount,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", newCustId);
+        }
+      }
+    }
+
+    // 5. Save updated receipt row
+    const updatePayload: any = {
+      customer_id: newCustId,
+      material_id,
+      weight,
+      unit: newMaterial.unit,
+      price_per_unit,
+      total_amount,
+      payment_method,
+      notes: notes || null,
+      updated_at: new Date().toISOString(),
+    };
+    if (created_at) {
+      updatePayload.created_at = created_at;
+    }
+
+    const { data: receipt, error: updateErr } = await supabase
+      .from("erp_purchase_receipts")
+      .update(updatePayload)
+      .eq("id", receiptId)
+      .select()
+      .single();
+
+    if (updateErr) throw updateErr;
+
+    // 6. Fetch fully formatted receipt to return
+    const { data: fullReceipt, error: getFullErr } = await supabase
+      .from("erp_purchase_receipts")
+      .select(`
+        *,
+        erp_customers(name, phone),
+        erp_materials(name, unit)
+      `)
+      .eq("id", receipt.id)
+      .single();
+
+    if (getFullErr) throw getFullErr;
+
+    const formatted = {
+      ...fullReceipt,
+      customer_name: fullReceipt.erp_customers?.name || "Walk-in Customer",
+      customer_phone: fullReceipt.erp_customers?.phone || "",
+      material_name: fullReceipt.erp_materials?.name || "",
+      material_unit: fullReceipt.erp_materials?.unit || "kg",
+    };
+
+    res.json({ success: true, receipt: formatted });
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
   }
