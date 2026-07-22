@@ -2186,11 +2186,14 @@ erpRouter.get("/dashboard", async (req, res) => {
         const profit_loss = Number((m.sell_revenue - cogs).toFixed(2));
         // Inventory value — buy cost of unsold stock (asset)
         const inventory_value = Number((unsold_weight * avg_buy_price).toFixed(2));
+        // Profit margin percentage on cost (COGS)
+        const profit_margin_pct = cogs > 0 ? Number(((profit_loss / cogs) * 100).toFixed(1)) : 0;
         return {
           ...m,
           avg_buy_price: Number(avg_buy_price.toFixed(2)),
           cogs,
           profit_loss,
+          profit_margin_pct,
           unsold_weight,
           inventory_value,
         };
