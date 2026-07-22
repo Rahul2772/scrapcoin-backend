@@ -1837,16 +1837,25 @@ erpRouter.get("/dashboard", async (req, res) => {
     startOfMonth.setDate(1);
     startOfMonth.setHours(0, 0, 0, 0);
 
-    const { data: txnsThisMonth, error: txnErr } = await supabase
-      .from("erp_transactions")
-      .select("total_amount, weight")
-      .gte("created_at", startOfMonth.toISOString());
+    const [{ data: txnsThisMonth, error: txnErr }, { data: buysThisMonth, error: buyErr }] = await Promise.all([
+      supabase
+        .from("erp_transactions")
+        .select("total_amount, weight")
+        .gte("created_at", startOfMonth.toISOString()),
+      supabase
+        .from("erp_purchase_receipts")
+        .select("total_amount")
+        .gte("created_at", startOfMonth.toISOString()),
+    ]);
 
     if (txnErr) throw txnErr;
+    // buyErr is non-fatal
 
     const revenueThisMonth = (txnsThisMonth || []).reduce((sum, t) => sum + Number(t.total_amount), 0);
     const weightThisMonth = (txnsThisMonth || []).reduce((sum, t) => sum + Number(t.weight), 0);
     const txnsCountThisMonth = (txnsThisMonth || []).length;
+    const buyCostThisMonth = (buysThisMonth || []).reduce((sum, t) => sum + Number(t.total_amount), 0);
+    const profitLoss = revenueThisMonth - buyCostThisMonth;
 
     // 2. Low stock alerts (materials where stock_qty <= min_threshold)
     const { data: lowStock, error: stockErr } = await supabase
@@ -2006,6 +2015,8 @@ erpRouter.get("/dashboard", async (req, res) => {
           revenue_this_month: revenueThisMonth,
           weight_this_month: weightThisMonth,
           txn_count_this_month: txnsCountThisMonth,
+          buy_cost_this_month: buyCostThisMonth,
+          profit_loss: profitLoss,
         },
         low_stock_alerts: lowStockAlerts,
         recent_transactions: formattedRecent,
