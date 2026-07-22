@@ -257,7 +257,73 @@ erpRouter.delete("/materials/:id", async (req, res) => {
   }
 });
 
-// ── 2. SUPPLIERS ──────────────────────────────────────────────────────────────
+// POST /api/erp/materials/recalculate-stock — Recalculate all material stock from transaction history
+erpRouter.post("/materials/recalculate-stock", async (req, res) => {
+  if (req.privilegedUser?.role !== "admin") {
+    return res.status(403).json({ success: false, message: "Admin access required." });
+  }
+
+  try {
+    // Fetch all active materials
+    const { data: materials, error: matErr } = await supabase
+      .from("erp_materials")
+      .select("id, name, stock_qty")
+      .eq("is_active", true);
+
+    if (matErr) throw matErr;
+
+    // Fetch all purchase receipts (buy from customers → adds stock)
+    const { data: receipts, error: rErr } = await supabase
+      .from("erp_purchase_receipts")
+      .select("material_id, weight");
+    if (rErr) throw rErr;
+
+    // Fetch all B2B transactions (sell to recyclers → removes stock)
+    const { data: transactions, error: tErr } = await supabase
+      .from("erp_transactions")
+      .select("material_id, weight");
+    if (tErr) throw tErr;
+
+    // Aggregate bought weight per material
+    const boughtMap: Record<string, number> = {};
+    (receipts || []).forEach((r) => {
+      boughtMap[r.material_id] = (boughtMap[r.material_id] || 0) + Number(r.weight);
+    });
+
+    // Aggregate sold weight per material
+    const soldMap: Record<string, number> = {};
+    (transactions || []).forEach((t) => {
+      soldMap[t.material_id] = (soldMap[t.material_id] || 0) + Number(t.weight);
+    });
+
+    const results: { id: string; name: string; old_stock: number; new_stock: number }[] = [];
+
+    // Update each material stock
+    for (const mat of materials || []) {
+      const bought = boughtMap[mat.id] || 0;
+      const sold = soldMap[mat.id] || 0;
+      const correct_stock = Math.max(0, bought - sold);
+
+      await supabase
+        .from("erp_materials")
+        .update({ stock_qty: correct_stock, updated_at: new Date().toISOString() })
+        .eq("id", mat.id);
+
+      results.push({
+        id: mat.id,
+        name: mat.name,
+        old_stock: Number(mat.stock_qty),
+        new_stock: correct_stock,
+      });
+    }
+
+    res.json({ success: true, message: `Recalculated stock for ${results.length} materials.`, results });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+
 
 // GET /api/erp/suppliers — List suppliers
 erpRouter.get("/suppliers", async (req, res) => {
