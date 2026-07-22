@@ -1018,26 +1018,44 @@ erpRouter.delete("/transactions/:id", async (req, res) => {
     const { data: txn, error: getErr } = await supabase.from("erp_transactions").select("*").eq("id", req.params.id).single();
     if (getErr || !txn) return res.status(404).json({ success: false, message: "Transaction not found." });
 
-    // 2. Fetch material stock
-    const { data: material, error: mErr } = await supabase.from("erp_materials").select("stock_qty").eq("id", txn.material_id).single();
-    if (mErr || !material) throw mErr;
+    const baseTxnNum = txn.txn_number.split("/")[0];
 
-    // 3. Reverse stock
-    await supabase
-      .from("erp_materials")
-      .update({
-        stock_qty: Math.max(0, Number(material.stock_qty) - Number(txn.weight)),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", txn.material_id);
+    // Find all siblings
+    const { data: siblings, error: sibErr } = await supabase
+      .from("erp_transactions")
+      .select("*")
+      .or(`txn_number.eq.${baseTxnNum},txn_number.like.${baseTxnNum}/%`);
 
-    // 4. Delete invoice & transaction (invoice cascading will occur if defined, but we delete manually to be safe)
-    await supabase.from("erp_invoices").delete().eq("transaction_id", req.params.id);
-    const { error: deleteErr } = await supabase.from("erp_transactions").delete().eq("id", req.params.id);
+    if (sibErr) throw sibErr;
 
-    if (deleteErr) throw deleteErr;
+    const oldSiblings = siblings || [];
+    for (const sib of oldSiblings) {
+      // Revert stock
+      const { data: material } = await supabase
+        .from("erp_materials")
+        .select("stock_qty")
+        .eq("id", sib.material_id)
+        .single();
 
-    res.json({ success: true, message: "Transaction and associated invoice deleted. Stock reversed." });
+      if (material) {
+        await supabase
+          .from("erp_materials")
+          .update({
+            stock_qty: Math.max(0, Number(material.stock_qty) - Number(sib.weight)),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", sib.material_id);
+      }
+
+      // Delete associated invoice
+      await supabase.from("erp_invoices").delete().eq("transaction_id", sib.id);
+
+      // Delete transaction row
+      const { error: deleteErr } = await supabase.from("erp_transactions").delete().eq("id", sib.id);
+      if (deleteErr) throw deleteErr;
+    }
+
+    res.json({ success: true, message: "Transaction group and associated invoice(s) deleted. Stock reversed." });
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
   }
