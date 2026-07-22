@@ -1920,8 +1920,35 @@ erpRouter.get("/dashboard", async (req, res) => {
     const revenueThisMonth = (txnsThisMonth || []).reduce((sum, t) => sum + Number(t.total_amount), 0);
     const weightThisMonth = (txnsThisMonth || []).reduce((sum, t) => sum + Number(t.weight), 0);
     const txnsCountThisMonth = (txnsThisMonth || []).length;
+
+    // All-time buy data for COGS calculation (needed to compute avg buy price per material)
+    const { data: allBuys } = await supabase
+      .from("erp_purchase_receipts")
+      .select("material_id, weight, total_amount");
+
+    // Build avg buy price per material (all time weighted average)
+    const avgBuyMap: Record<string, { total_cost: number; total_weight: number }> = {};
+    (allBuys || []).forEach((r: any) => {
+      if (!avgBuyMap[r.material_id]) avgBuyMap[r.material_id] = { total_cost: 0, total_weight: 0 };
+      avgBuyMap[r.material_id].total_cost += Number(r.total_amount);
+      avgBuyMap[r.material_id].total_weight += Number(r.weight);
+    });
+
+    // COGS this month = sold_weight * avg_buy_price per material
+    const { data: txnsThisMonthDetail } = await supabase
+      .from("erp_transactions")
+      .select("material_id, weight")
+      .gte("created_at", startOfMonth.toISOString());
+
+    const cogsThisMonth = (txnsThisMonthDetail || []).reduce((sum: number, t: any) => {
+      const avg = avgBuyMap[t.material_id];
+      const avgPrice = avg && avg.total_weight > 0 ? avg.total_cost / avg.total_weight : 0;
+      return sum + (Number(t.weight) * avgPrice);
+    }, 0);
+
     const buyCostThisMonth = (buysThisMonth || []).reduce((sum, t) => sum + Number(t.total_amount), 0);
-    const profitLoss = revenueThisMonth - buyCostThisMonth;
+    // P&L = sell revenue this month minus COGS (cost of what was actually sold, not all purchases)
+    const profitLoss = Number((revenueThisMonth - cogsThisMonth).toFixed(2));
 
     // 2. Low stock alerts (materials where stock_qty <= min_threshold)
     const { data: lowStock, error: stockErr } = await supabase
@@ -2113,11 +2140,25 @@ erpRouter.get("/dashboard", async (req, res) => {
     });
 
     const material_pnl = Object.values(pnlMap)
-      .map((m) => ({
-        ...m,
-        profit_loss: Number((m.sell_revenue - m.buy_cost).toFixed(2)),
-        unsold_weight: Math.max(0, m.buy_weight - m.sell_weight),
-      }))
+      .map((m) => {
+        const unsold_weight = Math.max(0, m.buy_weight - m.sell_weight);
+        // Average price paid per unit when buying from customers
+        const avg_buy_price = m.buy_weight > 0 ? m.buy_cost / m.buy_weight : 0;
+        // Cost of Goods Sold — only the portion of buy cost attributable to what was sold
+        const cogs = Number((m.sell_weight * avg_buy_price).toFixed(2));
+        // Profit/Loss only on sold quantity — unsold stock stays as inventory, not a loss
+        const profit_loss = Number((m.sell_revenue - cogs).toFixed(2));
+        // Inventory value — buy cost of unsold stock (asset)
+        const inventory_value = Number((unsold_weight * avg_buy_price).toFixed(2));
+        return {
+          ...m,
+          avg_buy_price: Number(avg_buy_price.toFixed(2)),
+          cogs,
+          profit_loss,
+          unsold_weight,
+          inventory_value,
+        };
+      })
       .sort((a, b) => b.profit_loss - a.profit_loss);
 
     res.json({
