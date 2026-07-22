@@ -1641,38 +1641,54 @@ erpRouter.delete("/purchase-receipts/:id", async (req, res) => {
     const { data: r, error: rErr } = await supabase.from("erp_purchase_receipts").select("*").eq("id", req.params.id).single();
     if (rErr || !r) return res.status(404).json({ success: false, message: "Receipt not found" });
 
-    // 2. Reverse stock
-    const { data: material } = await supabase.from("erp_materials").select("stock_qty").eq("id", r.material_id).single();
-    if (material) {
-      await supabase
-        .from("erp_materials")
-        .update({
-          stock_qty: Math.max(0, Number(material.stock_qty) - Number(r.weight)),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", r.material_id);
+    const baseReceiptNum = r.receipt_number.split("/")[0];
+
+    // Find all siblings under the same base receipt number
+    const { data: siblings, error: sibErr } = await supabase
+      .from("erp_purchase_receipts")
+      .select("*")
+      .or(`receipt_number.eq.${baseReceiptNum},receipt_number.like.${baseReceiptNum}/%`);
+
+    if (sibErr) throw sibErr;
+
+    const allReceipts = siblings || [];
+    let cumulativeTotal = 0;
+
+    for (const receipt of allReceipts) {
+      cumulativeTotal += Number(receipt.total_amount);
+
+      // Reverse stock
+      const { data: material } = await supabase.from("erp_materials").select("stock_qty").eq("id", receipt.material_id).single();
+      if (material) {
+        await supabase
+          .from("erp_materials")
+          .update({
+            stock_qty: Math.max(0, Number(material.stock_qty) - Number(receipt.weight)),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", receipt.material_id);
+      }
+
+      // Delete receipt record
+      await supabase.from("erp_purchase_receipts").delete().eq("id", receipt.id);
     }
 
     // 3. Reverse customer stats
-    if (r.customer_id) {
+    if (r.customer_id && cumulativeTotal > 0) {
       const { data: customer } = await supabase.from("erp_customers").select("total_visits, total_paid").eq("id", r.customer_id).single();
       if (customer) {
         await supabase
           .from("erp_customers")
           .update({
             total_visits: Math.max(0, Number(customer.total_visits || 0) - 1),
-            total_paid: Math.max(0, Number(customer.total_paid || 0) - Number(r.total_amount)),
+            total_paid: Math.max(0, Number(customer.total_paid || 0) - cumulativeTotal),
             updated_at: new Date().toISOString(),
           })
           .eq("id", r.customer_id);
       }
     }
 
-    // 4. Delete receipt record
-    const { error: deleteErr } = await supabase.from("erp_purchase_receipts").delete().eq("id", req.params.id);
-    if (deleteErr) throw deleteErr;
-
-    res.json({ success: true, message: "Receipt deleted" });
+    res.json({ success: true, message: "Receipt (and all associated materials) deleted and stock reversed." });
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
   }
