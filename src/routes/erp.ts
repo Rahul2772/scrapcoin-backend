@@ -1917,19 +1917,25 @@ erpRouter.get("/dashboard", async (req, res) => {
       }
     });
 
-    // 5. Monthly trend last 6 months (simulated using standard date aggregations)
-    // To support clean queries, we fetch all transactions of last 6 months and group them by Month in JS.
+    // 5. Monthly trend last 6 months — purchase (B2B erp_transactions) + sell (B2C erp_purchase_receipts)
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
 
-    const { data: trendsData, error: trendErr } = await supabase
-      .from("erp_transactions")
-      .select("total_amount, created_at")
-      .gte("created_at", sixMonthsAgo.toISOString());
+    const [{ data: trendsData, error: trendErr }, { data: sellTrendsData, error: sellTrendErr }] = await Promise.all([
+      supabase
+        .from("erp_transactions")
+        .select("total_amount, created_at")
+        .gte("created_at", sixMonthsAgo.toISOString()),
+      supabase
+        .from("erp_purchase_receipts")
+        .select("total_amount, created_at")
+        .gte("created_at", sixMonthsAgo.toISOString()),
+    ]);
 
     if (trendErr) throw trendErr;
+    // sellTrendErr is non-fatal — sell data may be empty if table not populated
 
-    const monthsMap: Record<string, { total_revenue: number; transaction_count: number }> = {};
+    const monthsMap: Record<string, { purchase_revenue: number; sell_revenue: number; transaction_count: number }> = {};
     const monthsOrder: string[] = [];
 
     // Initialize past 6 months in order
@@ -1937,21 +1943,30 @@ erpRouter.get("/dashboard", async (req, res) => {
       const d = new Date();
       d.setMonth(d.getMonth() - i);
       const label = d.toLocaleDateString("en-US", { month: "short" });
-      monthsMap[label] = { total_revenue: 0, transaction_count: 0 };
+      monthsMap[label] = { purchase_revenue: 0, sell_revenue: 0, transaction_count: 0 };
       monthsOrder.push(label);
     }
 
     (trendsData || []).forEach((t) => {
       const label = new Date(t.created_at).toLocaleDateString("en-US", { month: "short" });
       if (monthsMap[label]) {
-        monthsMap[label].total_revenue += Number(t.total_amount);
+        monthsMap[label].purchase_revenue += Number(t.total_amount);
         monthsMap[label].transaction_count++;
+      }
+    });
+
+    (sellTrendsData || []).forEach((t) => {
+      const label = new Date(t.created_at).toLocaleDateString("en-US", { month: "short" });
+      if (monthsMap[label]) {
+        monthsMap[label].sell_revenue += Number(t.total_amount);
       }
     });
 
     const monthly_trend = monthsOrder.map((month) => ({
       month,
-      total_revenue: monthsMap[month].total_revenue,
+      total_revenue: monthsMap[month].purchase_revenue,
+      purchase_revenue: monthsMap[month].purchase_revenue,
+      sell_revenue: monthsMap[month].sell_revenue,
       transaction_count: monthsMap[month].transaction_count,
     }));
 
