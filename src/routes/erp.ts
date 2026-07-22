@@ -766,11 +766,11 @@ erpRouter.post("/transactions", async (req, res) => {
 
       if (insertErr) throw insertErr;
 
-      // Update material stock
+      // Deduct from material stock — selling to recycler reduces inventory
       await supabase
         .from("erp_materials")
         .update({
-          stock_qty: Number(material.stock_qty) + item.weight,
+          stock_qty: Math.max(0, Number(material.stock_qty) - item.weight),
           updated_at: new Date().toISOString(),
         })
         .eq("id", item.material_id);
@@ -857,7 +857,7 @@ erpRouter.put("/transactions/:id", async (req, res) => {
     // 2. Revert stock, delete invoices and transaction rows for each sibling
     const oldSiblings = siblings || [];
     for (const sib of oldSiblings) {
-      // Revert stock
+      // Revert stock — restore material that was sold (undo the deduction)
       const { data: material } = await supabase
         .from("erp_materials")
         .select("stock_qty")
@@ -867,7 +867,7 @@ erpRouter.put("/transactions/:id", async (req, res) => {
         await supabase
           .from("erp_materials")
           .update({
-            stock_qty: Math.max(0, Number(material.stock_qty) - Number(sib.weight)),
+            stock_qty: Number(material.stock_qty) + Number(sib.weight),
             updated_at: new Date().toISOString(),
           })
           .eq("id", sib.material_id);
@@ -951,11 +951,11 @@ erpRouter.put("/transactions/:id", async (req, res) => {
 
       if (insertErr) throw insertErr;
 
-      // Add to material stock
+      // Deduct from material stock — selling to recycler reduces inventory
       await supabase
         .from("erp_materials")
         .update({
-          stock_qty: Number(material.stock_qty) + item.weight,
+          stock_qty: Math.max(0, Number(material.stock_qty) - item.weight),
           updated_at: new Date().toISOString(),
         })
         .eq("id", item.material_id);
@@ -1030,7 +1030,7 @@ erpRouter.delete("/transactions/:id", async (req, res) => {
 
     const oldSiblings = siblings || [];
     for (const sib of oldSiblings) {
-      // Revert stock
+      // Revert stock — restore material that was sold (undo the deduction)
       const { data: material } = await supabase
         .from("erp_materials")
         .select("stock_qty")
@@ -1041,7 +1041,7 @@ erpRouter.delete("/transactions/:id", async (req, res) => {
         await supabase
           .from("erp_materials")
           .update({
-            stock_qty: Math.max(0, Number(material.stock_qty) - Number(sib.weight)),
+            stock_qty: Number(material.stock_qty) + Number(sib.weight),
             updated_at: new Date().toISOString(),
           })
           .eq("id", sib.material_id);
