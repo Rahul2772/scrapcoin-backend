@@ -920,33 +920,7 @@ erpRouter.put("/transactions/:id", async (req, res) => {
 
     if (sibErr) throw sibErr;
 
-    // 2. Revert stock, delete invoices and transaction rows for each sibling
-    const oldSiblings = siblings || [];
-    for (const sib of oldSiblings) {
-      // Revert stock — restore material that was sold (undo the deduction)
-      const { data: material } = await supabase
-        .from("erp_materials")
-        .select("stock_qty")
-        .eq("id", sib.material_id)
-        .single();
-      if (material) {
-        await supabase
-          .from("erp_materials")
-          .update({
-            stock_qty: Number(material.stock_qty) + Number(sib.weight),
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", sib.material_id);
-      }
-
-      // Delete invoice
-      await supabase.from("erp_invoices").delete().eq("transaction_id", sib.id);
-
-      // Delete transaction row
-      await supabase.from("erp_transactions").delete().eq("id", sib.id);
-    }
-
-    // 3. Normalize new items
+    // 2. Normalize and validate new items FIRST before modifying DB
     let itemsToInsert: Array<{ material_id: string; weight: number; price_per_unit: number; gst_rate: number }> = [];
 
     if (items && items.length > 0) {
@@ -963,25 +937,66 @@ erpRouter.put("/transactions/:id", async (req, res) => {
       }];
     }
 
-    // 4. Verify supplier exists
+    // Verify supplier exists
     const { data: supplier, error: sErr } = await supabase.from("erp_suppliers").select("id, name").eq("id", supplier_id).eq("is_active", true).single();
-    if (sErr || !supplier) return res.status(404).json({ success: false, message: "Supplier not found or inactive." });
+    if (sErr || !supplier) return res.status(404).json({ success: false, message: "Recycler not found or inactive." });
 
-    // 5. Generate sequential base invoice_number prefix
-    const { count: invCount, error: invCountErr } = await supabase.from("erp_invoices").select("*", { count: "exact", head: true });
-    if (invCountErr) throw invCountErr;
+    // Verify all new materials exist
+    const validatedMaterials: Record<string, any> = {};
+    for (const item of itemsToInsert) {
+      const { data: mat, error: mErr } = await supabase
+        .from("erp_materials")
+        .select("id, name, unit, stock_qty")
+        .eq("id", item.material_id)
+        .eq("is_active", true)
+        .single();
+      if (mErr || !mat) return res.status(404).json({ success: false, message: `Material not found or inactive: ${item.material_id}` });
+      validatedMaterials[item.material_id] = mat;
+    }
+
+    // Preserve creation date unless explicitly provided with a valid date string
+    let targetCreatedAt = oldTxn.created_at;
+    if (created_at) {
+      const pDate = new Date(created_at);
+      if (!isNaN(pDate.getTime())) {
+        targetCreatedAt = pDate.toISOString();
+      }
+    }
+
+    // 3. Revert stock, delete old invoices and transaction rows
+    const oldSiblings = siblings || [];
+    for (const sib of oldSiblings) {
+      // Revert stock — restore material that was sold (undo deduction)
+      const { data: material } = await supabase
+        .from("erp_materials")
+        .select("stock_qty")
+        .eq("id", sib.material_id)
+        .single();
+      if (material) {
+        await supabase
+          .from("erp_materials")
+          .update({
+            stock_qty: Number(material.stock_qty) + Number(sib.weight),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", sib.material_id);
+      }
+
+      await supabase.from("erp_invoices").delete().eq("transaction_id", sib.id);
+      await supabase.from("erp_transactions").delete().eq("id", sib.id);
+    }
+
+    // 4. Generate base invoice_number prefix
+    const { count: invCount } = await supabase.from("erp_invoices").select("*", { count: "exact", head: true });
     const baseInvNum = `INV-${String((invCount || 0) + 1).padStart(5, "0")}`;
 
     let firstTxn: any = null;
     let firstInvoice: any = null;
 
-    // 6. Loop insert B2B items under baseTxnNum
+    // 5. Loop insert B2B items under baseTxnNum
     for (let i = 0; i < itemsToInsert.length; i++) {
       const item = itemsToInsert[i];
-
-      // Verify material exists
-      const { data: material, error: mErr } = await supabase.from("erp_materials").select("id, name, unit, stock_qty").eq("id", item.material_id).eq("is_active", true).single();
-      if (mErr || !material) return res.status(404).json({ success: false, message: `Material not found or inactive: ${item.material_id}` });
+      const material = validatedMaterials[item.material_id];
 
       const subtotal = Number((item.weight * item.price_per_unit).toFixed(2));
       const gst_amount = Number(((subtotal * item.gst_rate) / 100).toFixed(2));
@@ -989,7 +1004,6 @@ erpRouter.put("/transactions/:id", async (req, res) => {
 
       const txn_number = itemsToInsert.length > 1 ? `${baseTxnNum}/${i + 1}` : baseTxnNum;
 
-      // Create transaction row
       const txnPayload: any = {
         txn_number,
         supplier_id,
@@ -1003,11 +1017,9 @@ erpRouter.put("/transactions/:id", async (req, res) => {
         total_amount,
         notes,
         created_by: req.privilegedUser?.id,
+        created_at: targetCreatedAt,
         updated_at: new Date().toISOString(),
       };
-      if (created_at) {
-        txnPayload.created_at = created_at;
-      }
 
       const { data: txn, error: insertErr } = await supabase
         .from("erp_transactions")
@@ -1017,18 +1029,24 @@ erpRouter.put("/transactions/:id", async (req, res) => {
 
       if (insertErr) throw insertErr;
 
-      // Deduct from material stock — selling to recycler reduces inventory
+      // Fetch fresh material stock to deduct sold quantity
+      const { data: freshMat } = await supabase
+        .from("erp_materials")
+        .select("stock_qty")
+        .eq("id", item.material_id)
+        .single();
+      const currentStock = freshMat ? Number(freshMat.stock_qty) : Number(material.stock_qty);
+
       await supabase
         .from("erp_materials")
         .update({
-          stock_qty: Math.max(0, Number(material.stock_qty) - item.weight),
+          stock_qty: Math.max(0, currentStock - item.weight),
           updated_at: new Date().toISOString(),
         })
         .eq("id", item.material_id);
 
       const invoice_number = itemsToInsert.length > 1 ? `${baseInvNum}/${i + 1}` : baseInvNum;
 
-      // Auto-create invoice
       const invPayload: any = {
         invoice_number,
         transaction_id: txn.id,
@@ -1037,12 +1055,10 @@ erpRouter.put("/transactions/:id", async (req, res) => {
         due_date: due_date || null,
         payment_method: payment_method || null,
         status: payment_method ? "paid" : "pending",
-        paid_at: payment_method ? (created_at || new Date().toISOString()) : null,
+        paid_at: payment_method ? targetCreatedAt : null,
+        created_at: targetCreatedAt,
         updated_at: new Date().toISOString(),
       };
-      if (created_at) {
-        invPayload.created_at = created_at;
-      }
 
       const { data: invoice, error: invoiceErr } = await supabase
         .from("erp_invoices")
@@ -1069,6 +1085,7 @@ erpRouter.put("/transactions/:id", async (req, res) => {
       invoice: firstInvoice,
     });
   } catch (err: any) {
+    console.error("PUT /api/erp/transactions/:id error:", err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -1545,7 +1562,44 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
 
     if (sibErr) throw sibErr;
 
-    // 2. Revert stock and delete each old sibling
+    // 2. Normalize and validate ALL new items FIRST before modifying DB
+    let itemsToInsert: Array<{ material_id: string; weight: number; price_per_unit: number }> = [];
+
+    if (items && items.length > 0) {
+      itemsToInsert = items;
+    } else {
+      if (!parsed.data.material_id || !parsed.data.weight || parsed.data.price_per_unit === undefined) {
+        return res.status(422).json({ success: false, message: "Either items or material_id, weight and price_per_unit are required." });
+      }
+      itemsToInsert = [{
+        material_id: parsed.data.material_id,
+        weight: parsed.data.weight,
+        price_per_unit: parsed.data.price_per_unit
+      }];
+    }
+
+    // Verify all new materials exist
+    const validatedMaterials: Record<string, any> = {};
+    for (const item of itemsToInsert) {
+      const { data: mat, error: mErr } = await supabase
+        .from("erp_materials")
+        .select("id, name, unit, stock_qty")
+        .eq("id", item.material_id)
+        .single();
+      if (mErr || !mat) return res.status(404).json({ success: false, message: `Material not found: ${item.material_id}` });
+      validatedMaterials[item.material_id] = mat;
+    }
+
+    // Preserve creation date unless explicitly provided with a valid date string
+    let targetCreatedAt = oldReceipt.created_at;
+    if (created_at) {
+      const pDate = new Date(created_at);
+      if (!isNaN(pDate.getTime())) {
+        targetCreatedAt = pDate.toISOString();
+      }
+    }
+
+    // 3. Revert stock and delete each old sibling
     const oldSiblings = siblings || [];
     let oldCumulativeTotal = 0;
     const oldCustId = oldReceipt.customer_id;
@@ -1553,7 +1607,7 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
     for (const sib of oldSiblings) {
       oldCumulativeTotal += Number(sib.total_amount);
 
-      // Revert stock
+      // Revert stock (buying scrap adds stock, so revert subtracts)
       const { data: material } = await supabase
         .from("erp_materials")
         .select("stock_qty")
@@ -1569,7 +1623,6 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
           .eq("id", sib.material_id);
       }
 
-      // Delete old sibling
       await supabase.from("erp_purchase_receipts").delete().eq("id", sib.id);
     }
 
@@ -1592,36 +1645,13 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
       }
     }
 
-    // 3. Normalize new items to insert
-    let itemsToInsert: Array<{ material_id: string; weight: number; price_per_unit: number }> = [];
-
-    if (items && items.length > 0) {
-      itemsToInsert = items;
-    } else {
-      if (!parsed.data.material_id || !parsed.data.weight || parsed.data.price_per_unit === undefined) {
-        return res.status(422).json({ success: false, message: "Either items or material_id, weight and price_per_unit are required." });
-      }
-      itemsToInsert = [{
-        material_id: parsed.data.material_id,
-        weight: parsed.data.weight,
-        price_per_unit: parsed.data.price_per_unit
-      }];
-    }
-
+    // 4. Insert new items under baseReceiptNum
     let newCumulativeTotal = 0;
     let firstNewReceipt: any = null;
 
-    // 4. Insert new items under the same baseReceiptNum
     for (let i = 0; i < itemsToInsert.length; i++) {
       const item = itemsToInsert[i];
-
-      // Verify new material
-      const { data: material, error: mErr } = await supabase
-        .from("erp_materials")
-        .select("id, name, unit, stock_qty")
-        .eq("id", item.material_id)
-        .single();
-      if (mErr || !material) return res.status(404).json({ success: false, message: `Material not found: ${item.material_id}` });
+      const material = validatedMaterials[item.material_id];
 
       const total_amount = Number((item.weight * item.price_per_unit).toFixed(2));
       newCumulativeTotal += total_amount;
@@ -1639,11 +1669,9 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
         payment_method,
         notes: notes || null,
         created_by: req.privilegedUser?.id,
+        created_at: targetCreatedAt,
         updated_at: new Date().toISOString(),
       };
-      if (created_at) {
-        insertPayload.created_at = created_at;
-      }
 
       const { data: receipt, error: insertErr } = await supabase
         .from("erp_purchase_receipts")
@@ -1653,11 +1681,18 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
 
       if (insertErr) throw insertErr;
 
-      // Add weight to stock
+      // Fetch fresh material stock to add bought weight
+      const { data: freshMat } = await supabase
+        .from("erp_materials")
+        .select("stock_qty")
+        .eq("id", item.material_id)
+        .single();
+      const currentStock = freshMat ? Number(freshMat.stock_qty) : Number(material.stock_qty);
+
       await supabase
         .from("erp_materials")
         .update({
-          stock_qty: Number(material.stock_qty) + item.weight,
+          stock_qty: currentStock + item.weight,
           updated_at: new Date().toISOString(),
         })
         .eq("id", item.material_id);
@@ -1710,6 +1745,7 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
 
     res.json({ success: true, receipt: formatted });
   } catch (err: any) {
+    console.error("PUT /api/erp/purchase-receipts/:id error:", err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
