@@ -14,6 +14,24 @@ import {
   deleteBooking,
 } from "../db/store.js";
 
+async function createNotification(title: string, message: string, type: string, bookingId?: string) {
+  try {
+    const { error } = await supabase
+      .from("erp_notifications")
+      .insert({
+        title,
+        message,
+        type,
+        booking_id: bookingId,
+      });
+    if (error && error.code !== "42P01") {
+      console.error("[ERP Notifications] Error creating notification:", error);
+    }
+  } catch (err) {
+    console.error("[ERP Notifications] Exception creating notification:", err);
+  }
+}
+
 const bookingLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
@@ -85,6 +103,14 @@ bookingsRouter.post("/", bookingLimiter, async (req, res) => {
       updatedAt: now,
       userId,
     });
+
+    // In-app Notification
+    createNotification(
+      "New Booking Scheduled",
+      `New booking created by ${parsed.data.fullName} for tower ${parsed.data.tower || "N/A"}, society ${parsed.data.society} on ${parsed.data.pickupDate}. Items: ${parsed.data.materials.join(", ")}`,
+      "new_booking",
+      booking.id
+    );
     // Dispatch notifications asynchronously to not block the API response
     const materialsStr = parsed.data.materials.join(", ");
     const addressStr = parsed.data.tower ? `${parsed.data.tower}, ${parsed.data.society}` : parsed.data.society;
@@ -182,6 +208,54 @@ bookingsRouter.patch("/:id", requireAdminOrChampion, async (req, res) => {
       championId: parsed.data.championId,
     });
     if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    // In-app Notification for status change
+    if (parsed.data.status) {
+      createNotification(
+        "Booking Status Updated",
+        `Booking for ${booking.fullName} has been updated to status: "${parsed.data.status.toUpperCase()}".`,
+        "booking_status_change",
+        booking.id
+      );
+
+      // Twilio WhatsApp/SMS Alert to Customer
+      const status = parsed.data.status;
+      let userMessage = "";
+      if (status === "in_progress") {
+        userMessage = `Hello ${booking.fullName},\n\nOur representative (champion) is on the way for your pickup.\nStatus: In Progress\n\nThank you,\nThe Scrap Co.`;
+      } else if (status === "completed") {
+        userMessage = `Hello ${booking.fullName},\n\nYour pickup booking has been successfully completed.\nStatus: Completed\n\nThank you for choosing The Scrap Co.!`;
+      } else if (status === "cancelled") {
+        userMessage = `Hello ${booking.fullName},\n\nYour pickup booking has been cancelled.\nStatus: Cancelled\n\nIf you have any questions, please contact support@scrapco.in.`;
+      } else if (status === "scheduled") {
+        userMessage = `Hello ${booking.fullName},\n\nYour pickup booking is scheduled.\nDate: ${booking.pickupDate}\nStatus: Scheduled`;
+      }
+
+      if (userMessage) {
+        sendWhatsAppMessage(booking.phone, userMessage).then((waResult) => {
+          console.log(`[Status WA Notification] Dispatch to ${booking.phone}: ${waResult.success ? "success" : "failed"}`);
+        }).catch((err) => {
+          console.error("[Status WA Notification] Async Error:", err);
+        });
+
+        sendSMSMessage(booking.phone, userMessage).then((smsResult) => {
+          console.log(`[Status SMS Notification] Dispatch to ${booking.phone}: ${smsResult.success ? "success" : "failed"}`);
+        }).catch((err) => {
+          console.error("[Status SMS Notification] Async Error:", err);
+        });
+      }
+    }
+
+    // In-app Notification for Champion Assignment
+    if (parsed.data.championId) {
+      createNotification(
+        "Champion Assigned",
+        `Champion has been assigned to booking for ${booking.fullName}.`,
+        "champion_assigned",
+        booking.id
+      );
+    }
+
     return res.json(booking);
   } catch (err) {
     console.error("PATCH /api/bookings/:id error:", err);

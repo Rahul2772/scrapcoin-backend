@@ -153,3 +153,16 @@ ALTER TABLE erp_materials ALTER COLUMN category TYPE VARCHAR(50);
 ALTER TABLE erp_suppliers ADD COLUMN IF NOT EXISTS whatsapp VARCHAR(20);
 ALTER TABLE erp_suppliers ADD COLUMN IF NOT EXISTS upi VARCHAR(20);
 
+-- Migration: Add ERP Notifications Table
+CREATE TABLE IF NOT EXISTS erp_notifications (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title       VARCHAR(255) NOT NULL,
+  message     TEXT NOT NULL,
+  type        VARCHAR(50) NOT NULL DEFAULT 'general',
+  booking_id  UUID,
+  is_read     BOOLEAN DEFAULT FALSE,
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_erp_notifications_created ON erp_notifications(created_at DESC);
+
