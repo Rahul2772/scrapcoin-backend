@@ -2074,6 +2074,52 @@ erpRouter.get("/dashboard", async (req, res) => {
       .sort((a, b) => b.revenue - a.revenue)
       .slice(0, 5);
 
+    // 7. Material-wise Profit & Loss (all time)
+    const [{ data: allReceipts }, { data: allTxns }] = await Promise.all([
+      supabase
+        .from("erp_purchase_receipts")
+        .select("material_id, weight, total_amount, erp_materials(name, color_hex)"),
+      supabase
+        .from("erp_transactions")
+        .select("material_id, weight, total_amount, erp_materials(name, color_hex)"),
+    ]);
+
+    const pnlMap: Record<string, {
+      material_id: string;
+      material_name: string;
+      color_hex: string;
+      buy_weight: number;
+      buy_cost: number;
+      sell_weight: number;
+      sell_revenue: number;
+    }> = {};
+
+    (allReceipts || []).forEach((r: any) => {
+      const id = r.material_id;
+      const name = r.erp_materials?.name || "Unknown";
+      const color = r.erp_materials?.color_hex || "#ccc";
+      if (!pnlMap[id]) pnlMap[id] = { material_id: id, material_name: name, color_hex: color, buy_weight: 0, buy_cost: 0, sell_weight: 0, sell_revenue: 0 };
+      pnlMap[id].buy_weight += Number(r.weight);
+      pnlMap[id].buy_cost += Number(r.total_amount);
+    });
+
+    (allTxns || []).forEach((t: any) => {
+      const id = t.material_id;
+      const name = t.erp_materials?.name || "Unknown";
+      const color = t.erp_materials?.color_hex || "#ccc";
+      if (!pnlMap[id]) pnlMap[id] = { material_id: id, material_name: name, color_hex: color, buy_weight: 0, buy_cost: 0, sell_weight: 0, sell_revenue: 0 };
+      pnlMap[id].sell_weight += Number(t.weight);
+      pnlMap[id].sell_revenue += Number(t.total_amount);
+    });
+
+    const material_pnl = Object.values(pnlMap)
+      .map((m) => ({
+        ...m,
+        profit_loss: Number((m.sell_revenue - m.buy_cost).toFixed(2)),
+        unsold_weight: Math.max(0, m.buy_weight - m.sell_weight),
+      }))
+      .sort((a, b) => b.profit_loss - a.profit_loss);
+
     res.json({
       success: true,
       dashboard: {
@@ -2089,6 +2135,7 @@ erpRouter.get("/dashboard", async (req, res) => {
         monthly_trend,
         top_materials,
         invoice_summary,
+        material_pnl,
       },
     });
   } catch (err: any) {
