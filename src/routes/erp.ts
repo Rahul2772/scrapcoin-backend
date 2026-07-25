@@ -66,21 +66,22 @@ const transactionSchema = z.object({
 });
 
 const purchaseReceiptSchema = z.object({
-  customer_id: z.string().uuid().optional().nullable(),
+  customer_id: z.string().trim().optional().nullable().transform((val) => (val === "" ? null : val)),
   payment_method: z.string().optional().default("cash"),
   notes: z.string().trim().optional().nullable(),
   created_at: z.string().trim().optional().nullable(),
   // Single entry fallback
-  material_id: z.string().uuid().optional(),
+  material_id: z.string().trim().optional(),
   weight: z.number().positive().optional(),
   price_per_unit: z.number().nonnegative().optional(),
   // Multi entry
   items: z.array(z.object({
-    material_id: z.string().uuid(),
+    material_id: z.string().trim().min(1),
     weight: z.number().positive(),
     price_per_unit: z.number().nonnegative(),
   })).optional(),
 });
+
 
 const payInvoiceSchema = z.object({
   payment_method: z.enum(["cash", "upi", "bank_transfer", "cheque"]),
