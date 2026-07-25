@@ -1,12 +1,16 @@
 import { Router } from "express";
 import { requireAdminOrChampion } from "../middleware/requireAdminOrChampion.js";
 import { supabase } from "../lib/supabase.js";
+import { checkAndGenerate30DayNotifications } from "./erp.js";
 
 export const notificationsRouter = Router();
 
 // GET /api/notifications — List notifications
 notificationsRouter.get("/", requireAdminOrChampion, async (req, res) => {
   try {
+    // Check and trigger 30-day customer notifications
+    checkAndGenerate30DayNotifications().catch(() => {});
+
     const { data, error } = await supabase
       .from("erp_notifications")
       .select("*")

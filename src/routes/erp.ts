@@ -42,6 +42,7 @@ const customerSchema = z.object({
   id_type: z.string().trim().optional().nullable(),
   id_number: z.string().trim().optional().nullable(),
   notes: z.string().trim().optional().nullable(),
+  last_receipt_date: z.string().optional().nullable(),
 });
 
 const transactionSchema = z.object({
@@ -479,6 +480,79 @@ erpRouter.delete("/suppliers/:id", async (req, res) => {
 
 // ── 3. CUSTOMERS (B2C) ─────────────────────────────────────────────────────────
 
+// Helper to check customers whose last receipt is 30+ days ago and generate admin notifications
+export async function checkAndGenerate30DayNotifications() {
+  try {
+    const { data: customers, error } = await supabase
+      .from("erp_customers")
+      .select("*")
+      .eq("is_active", true);
+
+    if (error || !customers) return;
+
+    const now = new Date();
+
+    for (const c of customers) {
+      let lastReceiptDateStr = c.last_receipt_date || null;
+
+      // Fallback: check latest purchase receipt if not set on customer
+      if (!lastReceiptDateStr) {
+        const { data: latestReceipt } = await supabase
+          .from("erp_purchase_receipts")
+          .select("created_at")
+          .eq("customer_id", c.id)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (latestReceipt?.created_at) {
+          lastReceiptDateStr = latestReceipt.created_at;
+          await supabase
+            .from("erp_customers")
+            .update({ last_receipt_date: latestReceipt.created_at })
+            .eq("id", c.id);
+        }
+      }
+
+      if (!lastReceiptDateStr) continue;
+
+      const lastDate = new Date(lastReceiptDateStr);
+      const diffMs = now.getTime() - lastDate.getTime();
+      const daysSince = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+      if (daysSince >= 30) {
+        // Prevent duplicate notifications in last 30 days
+        const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+        const { data: existing } = await supabase
+          .from("erp_notifications")
+          .select("id")
+          .eq("customer_id", c.id)
+          .eq("type", "customer_30_days")
+          .gte("created_at", thirtyDaysAgo)
+          .limit(1);
+
+        if (!existing || existing.length === 0) {
+          const formattedDate = lastDate.toLocaleDateString("en-IN", {
+            day: "2-digit",
+            month: "2-digit",
+            year: "numeric",
+          });
+          await supabase.from("erp_notifications").insert({
+            title: `30-Day Pickup Trigger: ${c.name}`,
+            message: `Customer ${c.name} (${c.phone || "No phone"}) had their last scale receipt on ${formattedDate} (${daysSince} days ago). Trigger follow-up pickup request.`,
+            type: "customer_30_days",
+            customer_id: c.id,
+            is_read: false,
+            created_at: new Date().toISOString(),
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[30-Day Notification Check Error]", err);
+  }
+}
+
 // GET /api/erp/customers — List customers
 erpRouter.get("/customers", async (req, res) => {
   try {
@@ -495,6 +569,9 @@ erpRouter.get("/customers", async (req, res) => {
 
     if (error) throw error;
 
+    // Trigger check for 30-day customer notifications
+    checkAndGenerate30DayNotifications().catch(() => {});
+
     const enriched = await Promise.all(
       (customers || []).map(async (c) => {
         const { count, error: countErr } = await supabase
@@ -504,13 +581,34 @@ erpRouter.get("/customers", async (req, res) => {
 
         const { data: receipts } = await supabase
           .from("erp_purchase_receipts")
-          .select("total_amount")
-          .eq("customer_id", c.id);
+          .select("total_amount, created_at")
+          .eq("customer_id", c.id)
+          .order("created_at", { ascending: false });
 
         const totalPaid = (receipts || []).reduce((sum, r) => sum + Number(r.total_amount), 0);
 
+        let lastReceiptDateStr = c.last_receipt_date || null;
+        if (!lastReceiptDateStr && receipts && receipts.length > 0) {
+          lastReceiptDateStr = receipts[0].created_at;
+        }
+
+        let daysSinceLastReceipt: number | null = null;
+        let is30DayAlert = false;
+
+        if (lastReceiptDateStr) {
+          const lastDate = new Date(lastReceiptDateStr);
+          const diffMs = new Date().getTime() - lastDate.getTime();
+          daysSinceLastReceipt = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+          if (daysSinceLastReceipt >= 30) {
+            is30DayAlert = true;
+          }
+        }
+
         return {
           ...c,
+          last_receipt_date: lastReceiptDateStr,
+          days_since_last_receipt: daysSinceLastReceipt,
+          is_30_day_alert: is30DayAlert,
           visit_count: countErr ? 0 : count || 0,
           lifetime_paid: totalPaid,
         };
@@ -543,12 +641,38 @@ erpRouter.get("/customers/:id", async (req, res) => {
       .order("created_at", { ascending: false })
       .limit(50);
 
+    let lastReceiptDateStr = customer.last_receipt_date || null;
+    if (!lastReceiptDateStr && receipts && receipts.length > 0) {
+      lastReceiptDateStr = receipts[0].created_at;
+    }
+
+    let daysSinceLastReceipt: number | null = null;
+    let is30DayAlert = false;
+
+    if (lastReceiptDateStr) {
+      const lastDate = new Date(lastReceiptDateStr);
+      const diffMs = new Date().getTime() - lastDate.getTime();
+      daysSinceLastReceipt = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+      if (daysSinceLastReceipt >= 30) {
+        is30DayAlert = true;
+      }
+    }
+
     const formattedReceipts = (receipts || []).map((r) => ({
       ...r,
       material_name: r.erp_materials?.name || "Scrap Material",
     }));
 
-    res.json({ success: true, customer, receipts: formattedReceipts });
+    res.json({
+      success: true,
+      customer: {
+        ...customer,
+        last_receipt_date: lastReceiptDateStr,
+        days_since_last_receipt: daysSinceLastReceipt,
+        is_30_day_alert: is30DayAlert,
+      },
+      receipts: formattedReceipts,
+    });
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -573,6 +697,7 @@ erpRouter.post("/customers", async (req, res) => {
         id_type: parsed.data.id_type || "Aadhaar",
         id_number: parsed.data.id_number || null,
         notes: parsed.data.notes || null,
+        last_receipt_date: parsed.data.last_receipt_date || null,
       })
       .select()
       .single();
@@ -609,6 +734,63 @@ erpRouter.put("/customers/:id", async (req, res) => {
   }
 });
 
+// POST /api/erp/customers/:id/trigger-30-day-notification — Manually generate 30-day admin alert for customer
+erpRouter.post("/customers/:id/trigger-30-day-notification", async (req, res) => {
+  try {
+    const { data: customer, error: getErr } = await supabase
+      .from("erp_customers")
+      .select("*")
+      .eq("id", req.params.id)
+      .single();
+
+    if (getErr || !customer) {
+      return res.status(404).json({ success: false, message: "Customer not found." });
+    }
+
+    let lastReceiptDateStr = customer.last_receipt_date;
+    if (!lastReceiptDateStr) {
+      const { data: latestReceipt } = await supabase
+        .from("erp_purchase_receipts")
+        .select("created_at")
+        .eq("customer_id", customer.id)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (latestReceipt?.created_at) {
+        lastReceiptDateStr = latestReceipt.created_at;
+      }
+    }
+
+    const lastDate = lastReceiptDateStr ? new Date(lastReceiptDateStr) : new Date();
+    const daysSince = Math.floor((new Date().getTime() - lastDate.getTime()) / (1000 * 60 * 60 * 24));
+    const formattedDate = lastDate.toLocaleDateString("en-IN", { day: "2-digit", month: "2-digit", year: "numeric" });
+
+    const { data: notification, error: insertErr } = await supabase
+      .from("erp_notifications")
+      .insert({
+        title: `30-Day Pickup Trigger: ${customer.name}`,
+        message: `Customer ${customer.name} (${customer.phone || "No phone"}) had their last scale receipt on ${formattedDate} (${daysSince} days ago). Trigger follow-up pickup request.`,
+        type: "customer_30_days",
+        customer_id: customer.id,
+        is_read: false,
+        created_at: new Date().toISOString(),
+      })
+      .select()
+      .single();
+
+    if (insertErr) throw insertErr;
+
+    res.json({
+      success: true,
+      message: `30-day notification generated for admin regarding ${customer.name}`,
+      notification,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // DELETE /api/erp/customers/:id — Deactivate customer (Admin only)
 erpRouter.delete("/customers/:id", async (req, res) => {
   if (req.privilegedUser?.role !== "admin") {
@@ -627,6 +809,7 @@ erpRouter.delete("/customers/:id", async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
 
 // ── 4. TRANSACTIONS (B2B) ──────────────────────────────────────────────────────
 
@@ -1489,7 +1672,8 @@ erpRouter.post("/purchase-receipts", async (req, res) => {
     }
 
     // 3. Update customer stats if customer provided
-    if (customer_id && cumulativeTotal > 0) {
+    if (customer_id) {
+      const receiptDate = created_at || new Date().toISOString();
       const { data: customer } = await supabase.from("erp_customers").select("total_visits, total_paid").eq("id", customer_id).single();
       if (customer) {
         await supabase
@@ -1497,6 +1681,7 @@ erpRouter.post("/purchase-receipts", async (req, res) => {
           .update({
             total_visits: (customer.total_visits || 0) + 1,
             total_paid: Number(customer.total_paid || 0) + cumulativeTotal,
+            last_receipt_date: receiptDate,
             updated_at: new Date().toISOString(),
           })
           .eq("id", customer_id);
@@ -1704,7 +1889,8 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
 
     // 5. Update new customer stats
     const newCustId = customer_id || null;
-    if (newCustId && newCumulativeTotal > 0) {
+    if (newCustId) {
+      const receiptDate = targetCreatedAt || new Date().toISOString();
       const { data: customer } = await supabase
         .from("erp_customers")
         .select("total_visits, total_paid")
@@ -1716,6 +1902,7 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
           .update({
             total_visits: (customer.total_visits || 0) + 1,
             total_paid: Number(customer.total_paid || 0) + newCumulativeTotal,
+            last_receipt_date: receiptDate,
             updated_at: new Date().toISOString(),
           })
           .eq("id", newCustId);

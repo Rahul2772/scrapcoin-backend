@@ -166,3 +166,8 @@ CREATE TABLE IF NOT EXISTS erp_notifications (
 
 CREATE INDEX IF NOT EXISTS idx_erp_notifications_created ON erp_notifications(created_at DESC);
 
+-- Migration: Add last_receipt_date to B2C Customers & customer_id to Notifications
+ALTER TABLE erp_customers ADD COLUMN IF NOT EXISTS last_receipt_date TIMESTAMPTZ;
+ALTER TABLE erp_notifications ADD COLUMN IF NOT EXISTS customer_id UUID REFERENCES erp_customers(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_erp_customers_last_receipt ON erp_customers(last_receipt_date);
+
