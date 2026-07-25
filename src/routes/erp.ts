@@ -1865,7 +1865,6 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
           notes: notes || null,
           created_by: req.privilegedUser?.id || oldReceipt.created_by || null,
           created_at: targetCreatedAt,
-          updated_at: new Date().toISOString(),
         };
 
 
