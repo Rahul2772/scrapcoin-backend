@@ -22,6 +22,11 @@ export type Booking = {
   actualWeights?: Record<string, number>;
   championId?: string;
   championEmail?: string;
+  // CRM fields (admin manual entry from WhatsApp)
+  inquiryDate?: string | null;
+  lastCommunicationDate?: string | null;
+  statusComments?: string | null;
+  source?: "website" | "whatsapp" | "admin";
 };
 
 export type LivePickupItem = {

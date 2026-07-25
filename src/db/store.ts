@@ -103,6 +103,10 @@ export async function saveBooking(booking: Booking): Promise<Booking> {
     updated_at: booking.updatedAt,
     actual_weights: booking.actualWeights ?? {},
     champion_id: booking.championId ?? null,
+    inquiry_date: booking.inquiryDate ?? null,
+    last_communication_date: booking.lastCommunicationDate ?? null,
+    status_comments: booking.statusComments ?? null,
+    source: booking.source ?? "website",
   };
 
   if (booking.userId) {
@@ -168,6 +172,34 @@ export async function updateBooking(
   return rowToBooking(data);
 }
 
+export async function updateBookingCRM(
+  id: string,
+  crm: {
+    inquiryDate?: string | null;
+    lastCommunicationDate?: string | null;
+    statusComments?: string | null;
+  }
+): Promise<Booking | undefined> {
+  const updatePayload: Record<string, unknown> = {
+    updated_at: new Date().toISOString(),
+  };
+  if (crm.inquiryDate !== undefined) updatePayload.inquiry_date = crm.inquiryDate;
+  if (crm.lastCommunicationDate !== undefined) updatePayload.last_communication_date = crm.lastCommunicationDate;
+  if (crm.statusComments !== undefined) updatePayload.status_comments = crm.statusComments;
+
+  const { data, error } = await supabase
+    .from("bookings")
+    .update(updatePayload)
+    .eq("id", id)
+    .select("*, champion_profile:champion_id(email)")
+    .single();
+  if (error) {
+    if (error.code === "PGRST116") return undefined;
+    throw new Error(error.message);
+  }
+  return rowToBooking(data);
+}
+
 export async function deleteBooking(id: string): Promise<void> {
   const { error } = await supabase.from("bookings").delete().eq("id", id);
   if (error) throw new Error(error.message);
@@ -192,5 +224,9 @@ function rowToBooking(r: Record<string, unknown>): Booking {
     actualWeights: r.actual_weights as Record<string, number> | undefined,
     championId: r.champion_id as string | undefined,
     championEmail: championProfile?.email,
+    inquiryDate: r.inquiry_date as string | null | undefined,
+    lastCommunicationDate: r.last_communication_date as string | null | undefined,
+    statusComments: r.status_comments as string | null | undefined,
+    source: (r.source as Booking["source"]) ?? "website",
   };
 }

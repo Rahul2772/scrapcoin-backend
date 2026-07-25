@@ -171,3 +171,11 @@ ALTER TABLE erp_customers ADD COLUMN IF NOT EXISTS last_receipt_date TIMESTAMPTZ
 ALTER TABLE erp_notifications ADD COLUMN IF NOT EXISTS customer_id UUID REFERENCES erp_customers(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_erp_customers_last_receipt ON erp_customers(last_receipt_date);
 
+-- Migration: Add CRM tracking fields to bookings (admin manual entry from WhatsApp)
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inquiry_date          DATE;
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS last_communication_date DATE;
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS status_comments       TEXT;
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS source                VARCHAR(20) DEFAULT 'website';
+CREATE INDEX IF NOT EXISTS idx_bookings_source ON bookings(source);
+
+

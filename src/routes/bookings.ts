@@ -11,8 +11,10 @@ import {
   getBookings,
   saveBooking,
   updateBooking,
+  updateBookingCRM,
   deleteBooking,
 } from "../db/store.js";
+
 
 async function createNotification(title: string, message: string, type: string, bookingId?: string) {
   try {
@@ -53,6 +55,73 @@ const statusSchema = z.object({
   actualWeights: z.record(z.string(), z.number().nonnegative()).optional(),
   championId: z.string().nullable().optional(),
 });
+
+// Schema for admin-created bookings (WhatsApp/manual entry) — no rate limit
+const adminBookingSchema = z.object({
+  fullName: z.string().trim().min(2).max(120),
+  phone: z.string().trim().regex(/^[+\d\s\-()]{10,20}$/),
+  society: z.string().trim().min(1).max(200),
+  tower: z.string().trim().max(120).optional(),
+  pickupDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  materials: z.array(z.string().trim().min(1)).min(1),
+  source: z.enum(["website", "whatsapp", "admin"]).default("admin"),
+  status: z.enum(["scheduled", "in_progress", "completed", "cancelled"]).default("scheduled"),
+  inquiryDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+  lastCommunicationDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+  statusComments: z.string().trim().max(2000).optional().nullable(),
+});
+
+const crmUpdateSchema = z.object({
+  inquiryDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+  lastCommunicationDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+  statusComments: z.string().trim().max(2000).optional().nullable(),
+});
+
+// Helper: upsert ERP customer when booking is confirmed (scheduled/completed)
+async function upsertERPCustomerFromBooking(booking: {
+  fullName: string;
+  phone: string;
+  society: string;
+  tower?: string;
+}) {
+  try {
+    const address = booking.tower
+      ? `${booking.tower}, ${booking.society}`
+      : booking.society;
+
+    // Check if customer with same phone already exists
+    const { data: existing } = await supabase
+      .from("erp_customers")
+      .select("id")
+      .eq("phone", booking.phone)
+      .maybeSingle();
+
+    if (existing) {
+      // Already in ERP — just update address/name in case they changed
+      await supabase
+        .from("erp_customers")
+        .update({ name: booking.fullName, address, updated_at: new Date().toISOString() })
+        .eq("id", existing.id);
+      console.log(`[ERP] Updated existing customer phone=${booking.phone}`);
+    } else {
+      // Insert new ERP customer
+      const { randomUUID } = await import("node:crypto");
+      await supabase.from("erp_customers").insert({
+        id: randomUUID(),
+        name: booking.fullName,
+        phone: booking.phone,
+        whatsapp: booking.phone,
+        address,
+        notes: "Auto-created from booking confirmation",
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+      console.log(`[ERP] Created new customer from booking: ${booking.fullName}`);
+    }
+  } catch (err) {
+    console.error("[ERP] upsertERPCustomerFromBooking error:", err);
+  }
+}
 
 export const bookingsRouter = Router();
 
@@ -186,6 +255,86 @@ bookingsRouter.get("/:id", requireAdminOrChampion, async (req, res) => {
   }
 });
 
+// POST /api/bookings/admin — create a manual booking (admin/champion, no rate limit, for WhatsApp inquiries)
+bookingsRouter.post("/admin", requireAdminOrChampion, async (req, res) => {
+  const parsed = adminBookingSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Invalid booking payload",
+      details: parsed.error.flatten(),
+    });
+  }
+
+  const now = new Date().toISOString();
+  const { randomUUID } = await import("node:crypto");
+  try {
+    const booking = await saveBooking({
+      id: randomUUID(),
+      fullName: parsed.data.fullName,
+      phone: parsed.data.phone,
+      society: parsed.data.society,
+      tower: parsed.data.tower,
+      pickupDate: parsed.data.pickupDate,
+      materials: parsed.data.materials,
+      status: parsed.data.status,
+      createdAt: now,
+      updatedAt: now,
+      source: parsed.data.source,
+      inquiryDate: parsed.data.inquiryDate ?? null,
+      lastCommunicationDate: parsed.data.lastCommunicationDate ?? null,
+      statusComments: parsed.data.statusComments ?? null,
+      userId: req.privilegedUser?.id,
+    });
+
+    createNotification(
+      "New Admin Booking Created",
+      `Admin created a manual booking for ${parsed.data.fullName} (${parsed.data.source}) — Pickup: ${parsed.data.pickupDate}.`,
+      "new_booking",
+      booking.id
+    );
+
+    // Auto-upsert ERP customer if status is scheduled/completed
+    if (parsed.data.status === "scheduled" || parsed.data.status === "completed") {
+      upsertERPCustomerFromBooking({
+        fullName: parsed.data.fullName,
+        phone: parsed.data.phone,
+        society: parsed.data.society,
+        tower: parsed.data.tower,
+      });
+    }
+
+    return res.status(201).json({ message: "Booking created.", booking });
+  } catch (err) {
+    console.error("POST /api/bookings/admin error", err);
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "Failed to save booking",
+    });
+  }
+});
+
+// PATCH /api/bookings/:id/crm — update CRM tracking fields only (admin/champion)
+bookingsRouter.patch("/:id/crm", requireAdminOrChampion, async (req, res) => {
+  const parsed = crmUpdateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Invalid CRM update payload",
+      details: parsed.error.flatten(),
+    });
+  }
+  try {
+    const booking = await updateBookingCRM(String(req.params.id), {
+      inquiryDate: parsed.data.inquiryDate,
+      lastCommunicationDate: parsed.data.lastCommunicationDate,
+      statusComments: parsed.data.statusComments,
+    });
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+    return res.json(booking);
+  } catch (err) {
+    console.error("PATCH /api/bookings/:id/crm error:", err);
+    return res.status(500).json({ error: "Failed to update CRM fields" });
+  }
+});
+
 // PATCH /api/bookings/:id — update booking status/assignment (admin/champion)
 bookingsRouter.patch("/:id", requireAdminOrChampion, async (req, res) => {
   const parsed = statusSchema.safeParse(req.body);
@@ -208,6 +357,16 @@ bookingsRouter.patch("/:id", requireAdminOrChampion, async (req, res) => {
       championId: parsed.data.championId,
     });
     if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    // Auto-upsert ERP customer when booking becomes scheduled or completed
+    if (parsed.data.status === "scheduled" || parsed.data.status === "completed") {
+      upsertERPCustomerFromBooking({
+        fullName: booking.fullName,
+        phone: booking.phone,
+        society: booking.society,
+        tower: booking.tower,
+      });
+    }
 
     // In-app Notification for status change
     if (parsed.data.status) {
