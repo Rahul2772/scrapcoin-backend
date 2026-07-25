@@ -1739,13 +1739,21 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
 
     const baseReceiptNum = oldReceipt.receipt_number.split("/")[0];
 
-    // Find all siblings
-    const { data: siblings, error: sibErr } = await supabase
+    // Find all siblings using TWO separate queries to avoid unreliable .or() + LIKE with % wildcard
+    const { data: exactMatches, error: exactErr } = await supabase
       .from("erp_purchase_receipts")
       .select("*")
-      .or(`receipt_number.eq.${baseReceiptNum},receipt_number.like.${baseReceiptNum}/%`);
+      .eq("receipt_number", baseReceiptNum);
 
-    if (sibErr) throw sibErr;
+    const { data: suffixMatches, error: suffixErr } = await supabase
+      .from("erp_purchase_receipts")
+      .select("*")
+      .like("receipt_number", `${baseReceiptNum}/%`);
+
+    if (exactErr) throw exactErr;
+    if (suffixErr) throw suffixErr;
+
+    const oldSiblings = [...(exactMatches || []), ...(suffixMatches || [])];
 
     // 2. Normalize and validate ALL new items FIRST before modifying DB
     let itemsToInsert: Array<{ material_id: string; weight: number; price_per_unit: number }> = [];
@@ -1763,7 +1771,7 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
       }];
     }
 
-    // Verify all new materials exist
+    // Verify all new materials exist BEFORE touching DB
     const validatedMaterials: Record<string, any> = {};
     for (const item of itemsToInsert) {
       const { data: mat, error: mErr } = await supabase
@@ -1775,7 +1783,7 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
       validatedMaterials[item.material_id] = mat;
     }
 
-    // Preserve creation date unless explicitly provided with a valid date string
+    // Preserve creation date unless explicitly changed
     let targetCreatedAt = oldReceipt.created_at;
     if (created_at) {
       const pDate = new Date(created_at);
@@ -1784,15 +1792,13 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
       }
     }
 
-    // 3. Revert stock and delete each old sibling
-    const oldSiblings = siblings || [];
+    // 3. Revert stock for all old siblings and delete them
     let oldCumulativeTotal = 0;
     const oldCustId = oldReceipt.customer_id;
 
     for (const sib of oldSiblings) {
       oldCumulativeTotal += Number(sib.total_amount);
 
-      // Revert stock (buying scrap adds stock, so revert subtracts)
       const { data: material } = await supabase
         .from("erp_materials")
         .select("stock_qty")
@@ -1830,61 +1836,101 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
       }
     }
 
-    // 4. Insert new items under baseReceiptNum
+    // 4. Insert new items — with rollback: if any insert fails, re-insert old siblings
     let newCumulativeTotal = 0;
     let firstNewReceipt: any = null;
+    const insertedNewIds: string[] = [];
 
-    for (let i = 0; i < itemsToInsert.length; i++) {
-      const item = itemsToInsert[i];
-      const material = validatedMaterials[item.material_id];
+    try {
+      for (let i = 0; i < itemsToInsert.length; i++) {
+        const item = itemsToInsert[i];
+        const material = validatedMaterials[item.material_id];
 
-      const total_amount = Number((item.weight * item.price_per_unit).toFixed(2));
-      newCumulativeTotal += total_amount;
+        const total_amount = Number((item.weight * item.price_per_unit).toFixed(2));
+        newCumulativeTotal += total_amount;
 
-      const receipt_number = itemsToInsert.length > 1 ? `${baseReceiptNum}/${i + 1}` : baseReceiptNum;
+        const receipt_number = itemsToInsert.length > 1 ? `${baseReceiptNum}/${i + 1}` : baseReceiptNum;
 
-      const insertPayload: any = {
-        receipt_number,
-        customer_id: customer_id || null,
-        material_id: item.material_id,
-        weight: item.weight,
-        unit: material.unit,
-        price_per_unit: item.price_per_unit,
-        total_amount,
-        payment_method,
-        notes: notes || null,
-        created_by: req.privilegedUser?.id,
-        created_at: targetCreatedAt,
-        updated_at: new Date().toISOString(),
-      };
-
-      const { data: receipt, error: insertErr } = await supabase
-        .from("erp_purchase_receipts")
-        .insert(insertPayload)
-        .select()
-        .single();
-
-      if (insertErr) throw insertErr;
-
-      // Fetch fresh material stock to add bought weight
-      const { data: freshMat } = await supabase
-        .from("erp_materials")
-        .select("stock_qty")
-        .eq("id", item.material_id)
-        .single();
-      const currentStock = freshMat ? Number(freshMat.stock_qty) : Number(material.stock_qty);
-
-      await supabase
-        .from("erp_materials")
-        .update({
-          stock_qty: currentStock + item.weight,
+        const insertPayload: any = {
+          receipt_number,
+          customer_id: customer_id || null,
+          material_id: item.material_id,
+          weight: item.weight,
+          unit: material.unit,
+          price_per_unit: item.price_per_unit,
+          total_amount,
+          payment_method,
+          notes: notes || null,
+          created_by: req.privilegedUser?.id,
+          created_at: targetCreatedAt,
           updated_at: new Date().toISOString(),
-        })
-        .eq("id", item.material_id);
+        };
 
-      if (i === 0) {
-        firstNewReceipt = receipt;
+        const { data: receipt, error: insertErr } = await supabase
+          .from("erp_purchase_receipts")
+          .insert(insertPayload)
+          .select()
+          .single();
+
+        if (insertErr) throw insertErr;
+
+        insertedNewIds.push(receipt.id);
+
+        // Update stock for new item
+        const { data: freshMat } = await supabase
+          .from("erp_materials")
+          .select("stock_qty")
+          .eq("id", item.material_id)
+          .single();
+        const currentStock = freshMat ? Number(freshMat.stock_qty) : Number(material.stock_qty);
+
+        await supabase
+          .from("erp_materials")
+          .update({
+            stock_qty: currentStock + item.weight,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", item.material_id);
+
+        if (i === 0) {
+          firstNewReceipt = receipt;
+        }
       }
+    } catch (insertErr: any) {
+      // ROLLBACK: new inserts failed — delete any partially inserted new rows
+      for (const newId of insertedNewIds) {
+        await supabase.from("erp_purchase_receipts").delete().eq("id", newId);
+      }
+
+      // RESTORE: re-insert all old siblings so data is not lost
+      for (const sib of oldSiblings) {
+        const { id: _id, ...sibData } = sib as any;
+        await supabase.from("erp_purchase_receipts").insert({ ...sibData, id: sib.id });
+
+        // Restore stock
+        const { data: mat } = await supabase.from("erp_materials").select("stock_qty").eq("id", sib.material_id).single();
+        if (mat) {
+          await supabase.from("erp_materials").update({
+            stock_qty: Number(mat.stock_qty) + Number(sib.weight),
+            updated_at: new Date().toISOString(),
+          }).eq("id", sib.material_id);
+        }
+      }
+
+      // Restore customer stats
+      if (oldCustId && oldCumulativeTotal > 0) {
+        const { data: cust } = await supabase.from("erp_customers").select("total_visits, total_paid").eq("id", oldCustId).single();
+        if (cust) {
+          await supabase.from("erp_customers").update({
+            total_visits: Number(cust.total_visits || 0) + 1,
+            total_paid: Number(cust.total_paid || 0) + oldCumulativeTotal,
+            updated_at: new Date().toISOString(),
+          }).eq("id", oldCustId);
+        }
+      }
+
+      console.error("PUT /api/erp/purchase-receipts/:id — insert failed, rolled back:", insertErr);
+      return res.status(500).json({ success: false, message: `Failed to save updated receipt: ${insertErr.message}. Original data has been restored.` });
     }
 
     // 5. Update new customer stats
@@ -1902,40 +1948,61 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
           .update({
             total_visits: (customer.total_visits || 0) + 1,
             total_paid: Number(customer.total_paid || 0) + newCumulativeTotal,
-            last_receipt_date: receiptDate,
+            last_receipt_date: targetCreatedAt,
             updated_at: new Date().toISOString(),
           })
           .eq("id", newCustId);
       }
     }
 
-    // 6. Fetch fully formatted receipt to return
-    const { data: fullReceipt, error: getFullErr } = await supabase
+    // 6. Fetch all updated receipt rows to build the full grouped response
+    const { data: allNewRows, error: fetchNewErr } = await supabase
       .from("erp_purchase_receipts")
       .select(`
         *,
         erp_customers(name, phone),
         erp_materials(name, unit)
       `)
-      .eq("id", firstNewReceipt.id)
-      .single();
+      .like("receipt_number", `${baseReceiptNum}%`)
+      .order("receipt_number", { ascending: true });
 
-    if (getFullErr) throw getFullErr;
+    if (fetchNewErr) throw fetchNewErr;
 
-    const formatted = {
-      ...fullReceipt,
-      customer_name: fullReceipt.erp_customers?.name || "Walk-in Customer",
-      customer_phone: fullReceipt.erp_customers?.phone || "",
-      material_name: fullReceipt.erp_materials?.name || "",
-      material_unit: fullReceipt.erp_materials?.unit || "kg",
+    const formattedRows = (allNewRows || []).map((pr: any) => ({
+      id: pr.id,
+      receipt_number: pr.receipt_number,
+      customer_id: pr.customer_id,
+      material_id: pr.material_id,
+      weight: Number(pr.weight),
+      unit: pr.unit,
+      price_per_unit: Number(pr.price_per_unit),
+      total_amount: Number(pr.total_amount),
+      payment_method: pr.payment_method,
+      notes: pr.notes,
+      created_at: pr.created_at,
+      customer_name: pr.erp_customers?.name || "Walk-in Customer",
+      customer_phone: pr.erp_customers?.phone || "",
+      material_name: pr.erp_materials?.name || "",
+      material_unit: pr.erp_materials?.unit || "kg",
+    }));
+
+    // Return the first new receipt + all rows (so frontend can re-group properly)
+    const firstFormatted = formattedRows[0] || {
+      ...firstNewReceipt,
+      customer_name: "Walk-in Customer",
+      customer_phone: "",
+      material_name: "",
+      material_unit: "kg",
     };
 
-    res.json({ success: true, receipt: formatted });
+    res.json({ success: true, receipt: firstFormatted, receipts: formattedRows });
   } catch (err: any) {
     console.error("PUT /api/erp/purchase-receipts/:id error:", err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
+
 
 // DELETE /api/erp/purchase-receipts/:id — Delete household receipt & reverse stock (Admin only)
 erpRouter.delete("/purchase-receipts/:id", async (req, res) => {
