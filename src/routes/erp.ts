@@ -1644,8 +1644,9 @@ erpRouter.post("/purchase-receipts", async (req, res) => {
         total_amount,
         payment_method,
         notes: notes || null,
-        created_by: req.privilegedUser?.id,
+        created_by: req.privilegedUser?.id || null,
       };
+
       if (created_at) {
         insertPayload.created_at = created_at;
       }
@@ -1862,10 +1863,11 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
           total_amount,
           payment_method,
           notes: notes || null,
-          created_by: req.privilegedUser?.id,
+          created_by: req.privilegedUser?.id || oldReceipt.created_by || null,
           created_at: targetCreatedAt,
           updated_at: new Date().toISOString(),
         };
+
 
         const { data: receipt, error: insertErr } = await supabase
           .from("erp_purchase_receipts")
