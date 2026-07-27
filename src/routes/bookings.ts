@@ -335,6 +335,74 @@ bookingsRouter.patch("/:id/crm", requireAdminOrChampion, async (req, res) => {
   }
 });
 
+// PUT /api/bookings/:id — edit core booking fields (admin only)
+bookingsRouter.put("/:id", requireAdmin, async (req, res) => {
+  const editSchema = z.object({
+    fullName: z.string().trim().min(2).max(120).optional(),
+    phone: z.string().trim().min(6).max(20).optional(),
+    society: z.string().trim().min(2).max(200).optional(),
+    tower: z.string().trim().max(120).optional().nullable(),
+    pickupDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    materials: z.array(z.string().trim().min(1)).min(1).optional(),
+    source: z.enum(["website", "whatsapp", "admin"]).optional(),
+  });
+
+  const parsed = editSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid edit payload", details: parsed.error.flatten() });
+  }
+
+  try {
+    const booking = await getBookingById(String(req.params.id));
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    const updatePayload: Record<string, unknown> = { updated_at: new Date().toISOString() };
+    if (parsed.data.fullName  !== undefined) updatePayload.full_name  = parsed.data.fullName;
+    if (parsed.data.phone     !== undefined) updatePayload.phone      = parsed.data.phone;
+    if (parsed.data.society   !== undefined) updatePayload.society    = parsed.data.society;
+    if (parsed.data.tower     !== undefined) updatePayload.tower      = parsed.data.tower ?? null;
+    if (parsed.data.pickupDate!== undefined) updatePayload.pickup_date= parsed.data.pickupDate;
+    if (parsed.data.materials !== undefined) updatePayload.materials  = parsed.data.materials;
+    if (parsed.data.source    !== undefined) updatePayload.source     = parsed.data.source;
+
+    const { data, error } = await supabase
+      .from("bookings")
+      .update(updatePayload)
+      .eq("id", req.params.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Booking not found after update" });
+
+    // Map snake_case DB row → camelCase Booking shape expected by frontend
+    const updated = {
+      id: data.id,
+      fullName: data.full_name,
+      phone: data.phone,
+      society: data.society,
+      tower: data.tower,
+      pickupDate: data.pickup_date,
+      materials: data.materials ?? [],
+      status: data.status,
+      createdAt: data.created_at,
+      updatedAt: data.updated_at,
+      actualWeights: data.actual_weights,
+      championId: data.champion_id,
+      championEmail: booking.championEmail,
+      inquiryDate: data.inquiry_date,
+      lastCommunicationDate: data.last_communication_date,
+      statusComments: data.status_comments,
+      source: data.source,
+    };
+
+    return res.json(updated);
+  } catch (err) {
+    console.error("PUT /api/bookings/:id error:", err);
+    return res.status(500).json({ error: "Failed to update booking" });
+  }
+});
+
 // PATCH /api/bookings/:id — update booking status/assignment (admin/champion)
 bookingsRouter.patch("/:id", requireAdminOrChampion, async (req, res) => {
   const parsed = statusSchema.safeParse(req.body);
