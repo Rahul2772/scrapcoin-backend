@@ -41,11 +41,14 @@ const bookingLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+import { isPincodeSupported } from "../lib/pincodes.js";
+
 const bookingSchema = z.object({
   fullName: z.string().trim().min(2).max(120),
   phone: z.string().trim().regex(/^[+\d\s\-()]{10,20}$/),
   society: z.string().trim().min(3).max(200),
   tower: z.string().trim().max(120).optional(),
+  pincode: z.string().trim().regex(/^\d{6}$/, "Pincode must be 6 digits").optional(),
   pickupDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   materials: z.array(z.string().trim().min(1)).min(1),
 });
@@ -63,6 +66,7 @@ const adminBookingSchema = z.object({
   phone: z.string().trim().regex(/^[+\d\s\-()]{10,20}$/),
   society: z.string().trim().min(1).max(200),
   tower: z.string().trim().max(120).optional(),
+  pincode: z.string().trim().regex(/^\d{6}$/, "Pincode must be 6 digits").optional(),
   pickupDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   materials: z.array(z.string().trim().min(1)).min(1),
   source: z.enum(["website", "whatsapp", "admin"]).default("admin"),
@@ -148,6 +152,12 @@ bookingsRouter.post("/", bookingLimiter, async (req, res) => {
     return res.status(400).json({
       error: "Invalid booking payload",
       details: parsed.error.flatten(),
+    });
+  }
+
+  if (parsed.data.pincode && !isPincodeSupported(parsed.data.pincode)) {
+    return res.status(400).json({
+      error: `Pickup is currently not available for pincode ${parsed.data.pincode}. Supported areas: Noida, Greater Noida, Noida Extension & Indirapuram.`,
     });
   }
 
@@ -263,6 +273,12 @@ bookingsRouter.post("/admin", requireAdminOrChampion, async (req, res) => {
     return res.status(400).json({
       error: "Invalid booking payload",
       details: parsed.error.flatten(),
+    });
+  }
+
+  if (parsed.data.pincode && !isPincodeSupported(parsed.data.pincode)) {
+    return res.status(400).json({
+      error: `Pickup is currently not available for pincode ${parsed.data.pincode}. Supported areas: Noida, Greater Noida, Noida Extension & Indirapuram.`,
     });
   }
 
