@@ -119,7 +119,7 @@ async function upsertERPCustomerFromBooking(booking: {
     } else {
       // Insert new ERP customer
       const { randomUUID } = await import("node:crypto");
-      await supabase.from("erp_customers").insert({
+      const customerPayload: Record<string, unknown> = {
         id: randomUUID(),
         name: booking.fullName,
         phone: booking.phone,
@@ -128,7 +128,12 @@ async function upsertERPCustomerFromBooking(booking: {
         notes: "Auto-created from booking confirmation",
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
-      });
+      };
+      let { error: insertErr } = await supabase.from("erp_customers").insert(customerPayload);
+      if (insertErr && (insertErr.code === "PGRST204" || insertErr.message?.includes("column"))) {
+        delete customerPayload.whatsapp;
+        await supabase.from("erp_customers").insert(customerPayload);
+      }
       console.log(`[ERP] Created new customer from booking: ${booking.fullName}`);
     }
   } catch (err) {

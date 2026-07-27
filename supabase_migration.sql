@@ -176,6 +176,7 @@ ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inquiry_date          DATE;
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS last_communication_date DATE;
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS status_comments       TEXT;
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS source                VARCHAR(20) DEFAULT 'website';
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS pincode               VARCHAR(10);
 CREATE INDEX IF NOT EXISTS idx_bookings_source ON bookings(source);
 
 
