@@ -89,9 +89,6 @@ const crmUpdateSchema = z.object({
   lastCommunicationDate: optionalDateSchema,
   statusComments: optionalStringSchema,
 });
-  lastCommunicationDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
-  statusComments: z.string().trim().max(2000).optional().nullable(),
-});
 
 // Helper: upsert ERP customer when booking is confirmed (scheduled/completed)
 async function upsertERPCustomerFromBooking(booking: {

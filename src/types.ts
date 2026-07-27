@@ -13,6 +13,7 @@ export type Booking = {
   phone: string;
   society: string;
   tower?: string;
+  pincode?: string;
   pickupDate: string;
   materials: string[];
   status: BookingStatus;
