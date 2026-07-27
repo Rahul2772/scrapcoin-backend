@@ -54,6 +54,7 @@ const statusSchema = z.object({
   status: z.enum(["scheduled", "in_progress", "completed", "cancelled"]).optional(),
   actualWeights: z.record(z.string(), z.number().nonnegative()).optional(),
   championId: z.string().nullable().optional(),
+  statusComments: z.string().nullable().optional(),
 });
 
 // Schema for admin-created bookings (WhatsApp/manual entry) — no rate limit
@@ -423,6 +424,7 @@ bookingsRouter.patch("/:id", requireAdminOrChampion, async (req, res) => {
       status: parsed.data.status,
       actualWeights: parsed.data.actualWeights,
       championId: parsed.data.championId,
+      statusComments: parsed.data.statusComments,
     });
     if (!booking) return res.status(404).json({ error: "Booking not found" });
 

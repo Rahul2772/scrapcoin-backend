@@ -144,6 +144,7 @@ export async function updateBooking(
     status?: BookingStatus;
     actualWeights?: Record<string, number>;
     championId?: string | null;
+    statusComments?: string | null;
   }
 ): Promise<Booking | undefined> {
   const updatePayload: Record<string, unknown> = {
@@ -157,6 +158,9 @@ export async function updateBooking(
   }
   if (updates.championId !== undefined) {
     updatePayload.champion_id = updates.championId;
+  }
+  if (updates.statusComments !== undefined) {
+    updatePayload.status_comments = updates.statusComments;
   }
 
   const { data, error } = await supabase
