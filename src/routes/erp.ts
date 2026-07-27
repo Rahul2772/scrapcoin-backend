@@ -714,6 +714,7 @@ erpRouter.post("/customers", async (req, res) => {
 erpRouter.put("/customers/:id", async (req, res) => {
   const parsed = customerSchema.partial().safeParse(req.body);
   if (!parsed.success) {
+    console.error("[PUT /customers/:id] Validation error:", parsed.error.flatten());
     return res.status(422).json({ success: false, errors: parsed.error.flatten() });
   }
 
@@ -728,9 +729,19 @@ erpRouter.put("/customers/:id", async (req, res) => {
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      console.error("[PUT /customers/:id] Supabase error:", error);
+      throw error;
+    }
+
+    if (!data) {
+      console.error("[PUT /customers/:id] No data returned for id:", req.params.id);
+      return res.status(404).json({ success: false, message: "Customer not found or could not be updated." });
+    }
+
     res.json({ success: true, customer: data });
   } catch (err: any) {
+    console.error("[PUT /customers/:id] Unexpected error:", err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
