@@ -687,28 +687,47 @@ erpRouter.post("/customers", async (req, res) => {
   }
 
   try {
+    const insertPayload: Record<string, unknown> = {
+      name: parsed.data.name,
+      phone: parsed.data.phone || null,
+      whatsapp: parsed.data.whatsapp || null,
+      upi: parsed.data.upi || null,
+      address: parsed.data.address || null,
+      id_type: parsed.data.id_type || "Aadhaar",
+      id_number: parsed.data.id_number || null,
+      notes: parsed.data.notes || null,
+    };
+
+    if (parsed.data.last_receipt_date) {
+      insertPayload.last_receipt_date = parsed.data.last_receipt_date;
+    }
+
     const { data, error } = await supabase
       .from("erp_customers")
-      .insert({
-        name: parsed.data.name,
-        phone: parsed.data.phone || null,
-        whatsapp: parsed.data.whatsapp || null,
-        upi: parsed.data.upi || null,
-        address: parsed.data.address || null,
-        id_type: parsed.data.id_type || "Aadhaar",
-        id_number: parsed.data.id_number || null,
-        notes: parsed.data.notes || null,
-        last_receipt_date: parsed.data.last_receipt_date || null,
-      })
+      .insert(insertPayload)
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      if (error.code === "PGRST204" && String(error.message).includes("last_receipt_date")) {
+        delete insertPayload.last_receipt_date;
+        const { data: data2, error: error2 } = await supabase
+          .from("erp_customers")
+          .insert(insertPayload)
+          .select()
+          .single();
+        if (error2) throw error2;
+        return res.status(201).json({ success: true, customer: data2 });
+      }
+      throw error;
+    }
     res.status(201).json({ success: true, customer: data });
   } catch (err: any) {
+    console.error("POST /api/erp/customers error:", err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
 
 // PUT /api/erp/customers/:id — Edit customer
 erpRouter.put("/customers/:id", async (req, res) => {
