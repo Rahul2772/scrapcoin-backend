@@ -18,9 +18,10 @@ notificationsRouter.get("/", requireAdminOrChampion, async (req, res) => {
       .limit(100);
 
     if (error) {
-      // 42P01 is PostgreSQL code for "relation does not exist"
-      if (error.code === "42P01") {
-        console.warn("[ERP Notifications] Table 'erp_notifications' does not exist in Supabase yet. Please execute the SQL migration script.");
+      // 42P01 = PostgreSQL "relation does not exist"
+      // PGRST205 = PostgREST "table not found in schema cache"
+      if (error.code === "42P01" || error.code === "PGRST205") {
+        console.warn("GET /api/notifications: erp_notifications table not in schema yet — run the SQL migration. Returning empty array.");
         return res.json([]);
       }
       throw error;

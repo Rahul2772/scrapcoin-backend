@@ -719,17 +719,57 @@ erpRouter.put("/customers/:id", async (req, res) => {
   }
 
   try {
+    // Build the update payload with only columns that definitely exist in the schema.
+    // last_receipt_date is a newer migration column — include it only when provided,
+    // wrapped in a try so a missing column doesn't block the whole save.
+    const baseUpdate: Record<string, unknown> = {
+      name:        parsed.data.name,
+      phone:       parsed.data.phone ?? null,
+      whatsapp:    parsed.data.whatsapp ?? null,
+      upi:         parsed.data.upi ?? null,
+      address:     parsed.data.address ?? null,
+      id_type:     parsed.data.id_type ?? null,
+      id_number:   parsed.data.id_number ?? null,
+      notes:       parsed.data.notes ?? null,
+      updated_at:  new Date().toISOString(),
+    };
+
+    // Remove undefined keys so Supabase doesn't try to set them
+    Object.keys(baseUpdate).forEach((k) => {
+      if (baseUpdate[k] === undefined) delete baseUpdate[k];
+    });
+
+    // Attempt to include last_receipt_date if provided
+    if (parsed.data.last_receipt_date !== undefined) {
+      baseUpdate.last_receipt_date = parsed.data.last_receipt_date || null;
+    }
+
     const { data, error } = await supabase
       .from("erp_customers")
-      .update({
-        ...parsed.data,
-        updated_at: new Date().toISOString(),
-      })
+      .update(baseUpdate)
       .eq("id", req.params.id)
       .select()
       .single();
 
     if (error) {
+      // If last_receipt_date column doesn't exist yet (migration not run), retry without it
+      if (error.code === "PGRST204" && String(error.message).includes("last_receipt_date")) {
+        delete baseUpdate.last_receipt_date;
+        const { data: data2, error: error2 } = await supabase
+          .from("erp_customers")
+          .update(baseUpdate)
+          .eq("id", req.params.id)
+          .select()
+          .single();
+        if (error2) {
+          console.error("[PUT /customers/:id] Supabase error (retry):", error2);
+          throw error2;
+        }
+        if (!data2) {
+          return res.status(404).json({ success: false, message: "Customer not found or could not be updated." });
+        }
+        return res.json({ success: true, customer: data2 });
+      }
       console.error("[PUT /customers/:id] Supabase error:", error);
       throw error;
     }
