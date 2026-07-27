@@ -15,9 +15,26 @@ app.set("trust proxy", true);
 const port = Number(process.env.PORT ?? 4000);
 const corsOrigin = process.env.CORS_ORIGIN ?? "http://localhost:5173";
 
+// Always include production domains so the live site can talk to this backend
+const ALWAYS_ALLOWED_ORIGINS = [
+  "https://scrapco.in",
+  "https://www.scrapco.in",
+  "http://localhost:5173",
+  "http://localhost:4000",
+];
+const allowedOrigins = Array.from(
+  new Set([
+    ...corsOrigin.split(",").map((o) => o.trim()),
+    ...ALWAYS_ALLOWED_ORIGINS,
+  ])
+);
+
 app.use(
   cors({
-    origin: corsOrigin.split(",").map((o) => o.trim()),
+    origin: allowedOrigins,
+    methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
   })
 );
 app.use(express.json());
