@@ -53,11 +53,19 @@ const bookingSchema = z.object({
   materials: z.array(z.string().trim().min(1)).min(1),
 });
 
+const optionalDateSchema = z
+  .union([z.string().regex(/^\d{4}-\d{2}-\d{2}$/), z.literal(""), z.null(), z.undefined()])
+  .transform((val) => (val === "" ? null : val));
+
+const optionalStringSchema = z
+  .union([z.string().trim().max(2000), z.null(), z.undefined()])
+  .transform((val) => (val === "" ? null : val));
+
 const statusSchema = z.object({
   status: z.enum(["scheduled", "in_progress", "completed", "cancelled"]).optional(),
   actualWeights: z.record(z.string(), z.number().nonnegative()).optional(),
   championId: z.string().nullable().optional(),
-  statusComments: z.string().nullable().optional(),
+  statusComments: optionalStringSchema,
 });
 
 // Schema for admin-created bookings (WhatsApp/manual entry) — no rate limit
@@ -66,18 +74,21 @@ const adminBookingSchema = z.object({
   phone: z.string().trim().regex(/^[+\d\s\-()]{10,20}$/),
   society: z.string().trim().min(1).max(200),
   tower: z.string().trim().max(120).optional(),
-  pincode: z.string().trim().regex(/^\d{6}$/, "Pincode must be 6 digits").optional(),
+  pincode: z.union([z.string().trim().regex(/^\d{6}$/, "Pincode must be 6 digits"), z.literal(""), z.null(), z.undefined()]).transform((v) => (v === "" ? undefined : v)),
   pickupDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   materials: z.array(z.string().trim().min(1)).min(1),
   source: z.enum(["website", "whatsapp", "admin"]).default("admin"),
   status: z.enum(["scheduled", "in_progress", "completed", "cancelled"]).default("scheduled"),
-  inquiryDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
-  lastCommunicationDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
-  statusComments: z.string().trim().max(2000).optional().nullable(),
+  inquiryDate: optionalDateSchema,
+  lastCommunicationDate: optionalDateSchema,
+  statusComments: optionalStringSchema,
 });
 
 const crmUpdateSchema = z.object({
-  inquiryDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+  inquiryDate: optionalDateSchema,
+  lastCommunicationDate: optionalDateSchema,
+  statusComments: optionalStringSchema,
+});
   lastCommunicationDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
   statusComments: z.string().trim().max(2000).optional().nullable(),
 });

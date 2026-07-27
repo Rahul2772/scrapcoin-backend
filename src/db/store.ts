@@ -109,17 +109,30 @@ export async function saveBooking(booking: Booking): Promise<Booking> {
     source: booking.source ?? "website",
   };
 
+  if (booking.pincode) {
+    insertPayload.pincode = booking.pincode;
+  }
   if (booking.userId) {
     insertPayload.user_id = booking.userId;
   }
 
-  const { error } = await supabase.from("bookings").insert(insertPayload);
+  let { error } = await supabase.from("bookings").insert(insertPayload);
+
+  if (error && (error.code === "PGRST204" || error.message?.includes("schema cache") || error.message?.includes("column"))) {
+    console.warn("[saveBooking] Retrying insertion without optional CRM/pincode columns due to missing DB columns:", error.message);
+    delete insertPayload.inquiry_date;
+    delete insertPayload.last_communication_date;
+    delete insertPayload.status_comments;
+    delete insertPayload.source;
+    delete insertPayload.pincode;
+    delete insertPayload.user_id;
+
+    const retryResult = await supabase.from("bookings").insert(insertPayload);
+    error = retryResult.error;
+  }
+
   if (error) {
-    if (error.message?.includes("user_id") && error.message.includes("does not exist")) {
-      throw new Error(
-        "Supabase bookings table is missing the user_id column. Add user_id to bookings."
-      );
-    }
+    console.error("[saveBooking] Error inserting booking:", error);
     throw new Error(error.message);
   }
   return booking;
