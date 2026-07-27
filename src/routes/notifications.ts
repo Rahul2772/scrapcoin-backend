@@ -57,6 +57,28 @@ notificationsRouter.post("/mark-all-read", requireAdminOrChampion, async (req, r
   }
 });
 
+// PATCH /api/notifications/:id/read — Mark a single notification as read
+notificationsRouter.patch("/:id/read", requireAdminOrChampion, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from("erp_notifications")
+      .update({ is_read: true })
+      .eq("id", req.params.id);
+
+    if (error) {
+      if (error.code === "42P01" || error.code === "PGRST205") {
+        return res.json({ success: true, message: "Notification table not found" });
+      }
+      throw error;
+    }
+
+    return res.json({ success: true, message: "Notification marked as read" });
+  } catch (err: any) {
+    console.error("PATCH /api/notifications/:id/read error:", err);
+    return res.status(500).json({ error: "Failed to mark notification as read" });
+  }
+});
+
 // DELETE /api/notifications — Clear all notifications
 notificationsRouter.delete("/", requireAdminOrChampion, async (req, res) => {
   try {
