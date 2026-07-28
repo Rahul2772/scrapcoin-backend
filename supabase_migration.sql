@@ -200,32 +200,60 @@ ALTER TABLE erp_notifications     ENABLE ROW LEVEL SECURITY;
 
 -- Allow authenticated Supabase users (logged-in frontend) to READ ERP data.
 -- Writes are blocked for authenticated users too — only service_role (backend) can write.
-CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_materials
-  FOR SELECT TO authenticated USING (true);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'erp_materials' AND policyname = 'erp_authenticated_read') THEN
+    CREATE POLICY "erp_authenticated_read" ON erp_materials FOR SELECT TO authenticated USING (true);
+  END IF;
+END $$;
 
-CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_suppliers
-  FOR SELECT TO authenticated USING (true);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'erp_suppliers' AND policyname = 'erp_authenticated_read') THEN
+    CREATE POLICY "erp_authenticated_read" ON erp_suppliers FOR SELECT TO authenticated USING (true);
+  END IF;
+END $$;
 
-CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_customers
-  FOR SELECT TO authenticated USING (true);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'erp_customers' AND policyname = 'erp_authenticated_read') THEN
+    CREATE POLICY "erp_authenticated_read" ON erp_customers FOR SELECT TO authenticated USING (true);
+  END IF;
+END $$;
 
-CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_transactions
-  FOR SELECT TO authenticated USING (true);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'erp_transactions' AND policyname = 'erp_authenticated_read') THEN
+    CREATE POLICY "erp_authenticated_read" ON erp_transactions FOR SELECT TO authenticated USING (true);
+  END IF;
+END $$;
 
-CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_invoices
-  FOR SELECT TO authenticated USING (true);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'erp_invoices' AND policyname = 'erp_authenticated_read') THEN
+    CREATE POLICY "erp_authenticated_read" ON erp_invoices FOR SELECT TO authenticated USING (true);
+  END IF;
+END $$;
 
-CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_purchase_receipts
-  FOR SELECT TO authenticated USING (true);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'erp_purchase_receipts' AND policyname = 'erp_authenticated_read') THEN
+    CREATE POLICY "erp_authenticated_read" ON erp_purchase_receipts FOR SELECT TO authenticated USING (true);
+  END IF;
+END $$;
 
-CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_price_history
-  FOR SELECT TO authenticated USING (true);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'erp_price_history' AND policyname = 'erp_authenticated_read') THEN
+    CREATE POLICY "erp_authenticated_read" ON erp_price_history FOR SELECT TO authenticated USING (true);
+  END IF;
+END $$;
 
-CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_whatsapp_logs
-  FOR SELECT TO authenticated USING (true);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'erp_whatsapp_logs' AND policyname = 'erp_authenticated_read') THEN
+    CREATE POLICY "erp_authenticated_read" ON erp_whatsapp_logs FOR SELECT TO authenticated USING (true);
+  END IF;
+END $$;
 
-CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_notifications
-  FOR SELECT TO authenticated USING (true);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'erp_notifications' AND policyname = 'erp_authenticated_read') THEN
+    CREATE POLICY "erp_authenticated_read" ON erp_notifications FOR SELECT TO authenticated USING (true);
+  END IF;
+END $$;
+
 
 -- NOTE: No INSERT/UPDATE/DELETE policies are created for authenticated users.
 -- All writes go through the backend (service_role key bypasses RLS).
