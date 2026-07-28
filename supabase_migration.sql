@@ -171,13 +171,59 @@ ALTER TABLE erp_customers ADD COLUMN IF NOT EXISTS last_receipt_date TIMESTAMPTZ
 ALTER TABLE erp_notifications ADD COLUMN IF NOT EXISTS customer_id UUID REFERENCES erp_customers(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_erp_customers_last_receipt ON erp_customers(last_receipt_date);
 
--- Migration: Add CRM tracking fields to bookings (admin manual entry from WhatsApp)
-ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inquiry_date          DATE;
+-- =============================================================================
+-- BOOKINGS TABLE
+-- Household customer pickup appointment bookings (B2C inbound flow).
+-- This table was created outside the migration — defined here for completeness
+-- so the full schema lives in one place. Safe to run on existing databases.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS bookings (
+  id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  full_name               VARCHAR(255) NOT NULL,
+  phone                   VARCHAR(20)  NOT NULL,
+  society                 TEXT         NOT NULL,
+  tower                   VARCHAR(120),
+  pickup_date             DATE         NOT NULL,
+  materials               TEXT[]       NOT NULL DEFAULT '{}',
+  status                  VARCHAR(30)  NOT NULL DEFAULT 'pending'
+                            CHECK (status IN ('pending','confirmed','completed','cancelled')),
+  actual_weights          JSONB        DEFAULT '{}',
+  champion_id             UUID         REFERENCES auth.users(id) ON DELETE SET NULL,
+  user_id                 UUID         REFERENCES auth.users(id) ON DELETE SET NULL,
+  -- CRM fields (added via migration below — kept here for reference)
+  inquiry_date            DATE,
+  last_communication_date DATE,
+  status_comments         TEXT,
+  source                  VARCHAR(20)  DEFAULT 'website'
+                            CHECK (source IN ('website','whatsapp','phone','walkin')),
+  pincode                 VARCHAR(10),
+  created_at              TIMESTAMPTZ  DEFAULT NOW(),
+  updated_at              TIMESTAMPTZ  DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_bookings_status     ON bookings(status);
+CREATE INDEX IF NOT EXISTS idx_bookings_pickup     ON bookings(pickup_date);
+CREATE INDEX IF NOT EXISTS idx_bookings_champion   ON bookings(champion_id);
+CREATE INDEX IF NOT EXISTS idx_bookings_user       ON bookings(user_id);
+CREATE INDEX IF NOT EXISTS idx_bookings_created    ON bookings(created_at DESC);
+
+-- RLS
+ALTER TABLE bookings ENABLE ROW LEVEL SECURITY;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'bookings' AND policyname = 'bookings_authenticated_read') THEN
+    CREATE POLICY "bookings_authenticated_read" ON bookings FOR SELECT TO authenticated USING (true);
+  END IF;
+END $$;
+
+-- Migration: Add CRM tracking fields to bookings — safe to re-run (IF NOT EXISTS)
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inquiry_date            DATE;
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS last_communication_date DATE;
-ALTER TABLE bookings ADD COLUMN IF NOT EXISTS status_comments       TEXT;
-ALTER TABLE bookings ADD COLUMN IF NOT EXISTS source                VARCHAR(20) DEFAULT 'website';
-ALTER TABLE bookings ADD COLUMN IF NOT EXISTS pincode               VARCHAR(10);
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS status_comments         TEXT;
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS source                  VARCHAR(20) DEFAULT 'website';
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS pincode                 VARCHAR(10);
 CREATE INDEX IF NOT EXISTS idx_bookings_source ON bookings(source);
+
 
 -- =============================================================================
 -- ROW LEVEL SECURITY (RLS)
