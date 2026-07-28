@@ -179,4 +179,57 @@ ALTER TABLE bookings ADD COLUMN IF NOT EXISTS source                VARCHAR(20) 
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS pincode               VARCHAR(10);
 CREATE INDEX IF NOT EXISTS idx_bookings_source ON bookings(source);
 
+-- =============================================================================
+-- ROW LEVEL SECURITY (RLS)
+-- Applied to all ERP tables to block direct anon/public access.
+-- The Express backend uses SUPABASE_SERVICE_KEY which bypasses RLS entirely,
+-- so no backend queries are affected. The frontend anon key cannot read ERP
+-- data directly — all ERP access must go through the authenticated API.
+-- =============================================================================
+
+-- Enable RLS on all ERP tables
+ALTER TABLE erp_materials         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE erp_suppliers         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE erp_customers         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE erp_transactions      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE erp_invoices          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE erp_purchase_receipts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE erp_price_history     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE erp_whatsapp_logs     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE erp_notifications     ENABLE ROW LEVEL SECURITY;
+
+-- Allow authenticated Supabase users (logged-in frontend) to READ ERP data.
+-- Writes are blocked for authenticated users too — only service_role (backend) can write.
+CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_materials
+  FOR SELECT TO authenticated USING (true);
+
+CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_suppliers
+  FOR SELECT TO authenticated USING (true);
+
+CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_customers
+  FOR SELECT TO authenticated USING (true);
+
+CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_transactions
+  FOR SELECT TO authenticated USING (true);
+
+CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_invoices
+  FOR SELECT TO authenticated USING (true);
+
+CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_purchase_receipts
+  FOR SELECT TO authenticated USING (true);
+
+CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_price_history
+  FOR SELECT TO authenticated USING (true);
+
+CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_whatsapp_logs
+  FOR SELECT TO authenticated USING (true);
+
+CREATE POLICY IF NOT EXISTS "erp_authenticated_read" ON erp_notifications
+  FOR SELECT TO authenticated USING (true);
+
+-- NOTE: No INSERT/UPDATE/DELETE policies are created for authenticated users.
+-- All writes go through the backend (service_role key bypasses RLS).
+-- Anon (unauthenticated) users have zero access to any ERP table.
+
+
 
