@@ -9,6 +9,30 @@ export const erpRouter = Router();
 // Secure all ERP endpoints under admin / champion check
 erpRouter.use(requireAdminOrChampion);
 
+// ── HELPER: Recalculate & persist weighted average buy cost for a material ────
+// Called after every purchase receipt INSERT / UPDATE / DELETE to keep
+// erp_materials.avg_cost_per_unit always up to date.
+async function refreshAvgCostPerUnit(materialId: string): Promise<void> {
+  try {
+    const { data: receipts } = await supabase
+      .from("erp_purchase_receipts")
+      .select("weight, total_amount")
+      .eq("material_id", materialId);
+
+    const totalWeight = (receipts || []).reduce((s, r) => s + Number(r.weight), 0);
+    const totalCost   = (receipts || []).reduce((s, r) => s + Number(r.total_amount), 0);
+    const avg = totalWeight > 0 ? Number((totalCost / totalWeight).toFixed(2)) : 0;
+
+    await supabase
+      .from("erp_materials")
+      .update({ avg_cost_per_unit: avg, updated_at: new Date().toISOString() })
+      .eq("id", materialId);
+  } catch (err) {
+    // Non-fatal — log and continue so receipt operations are never blocked
+    console.warn(`[refreshAvgCostPerUnit] Failed for material ${materialId}:`, err);
+  }
+}
+
 // ── ZOD SCHEMAS ──────────────────────────────────────────────────────────────
 
 const materialSchema = z.object({
@@ -112,6 +136,7 @@ erpRouter.get("/materials", async (req, res) => {
       sell_price: Number(m.sell_price),
       stock_qty: Number(m.stock_qty),
       min_threshold: Number(m.min_threshold),
+      avg_cost_per_unit: Number(m.avg_cost_per_unit ?? 0),
       color_hex: m.color_hex,
       is_active: m.is_active,
       updated_at: m.updated_at,
@@ -1738,6 +1763,9 @@ erpRouter.post("/purchase-receipts", async (req, res) => {
         })
         .eq("id", item.material_id);
 
+      // Refresh weighted average buy cost for this material
+      await refreshAvgCostPerUnit(item.material_id);
+
       if (i === 0) {
         firstReceipt = receipt;
       }
@@ -1964,6 +1992,9 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
           })
           .eq("id", item.material_id);
 
+        // Refresh weighted average buy cost after each item is inserted
+        await refreshAvgCostPerUnit(item.material_id);
+
         if (i === 0) {
           firstNewReceipt = receipt;
         }
@@ -2117,6 +2148,9 @@ erpRouter.delete("/purchase-receipts/:id", async (req, res) => {
 
       // Delete receipt record
       await supabase.from("erp_purchase_receipts").delete().eq("id", receipt.id);
+
+      // Refresh weighted average buy cost after deletion
+      await refreshAvgCostPerUnit(receipt.material_id);
     }
 
     // 3. Reverse customer stats

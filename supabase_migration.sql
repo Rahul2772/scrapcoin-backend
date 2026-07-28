@@ -171,6 +171,10 @@ ALTER TABLE erp_customers ADD COLUMN IF NOT EXISTS last_receipt_date TIMESTAMPTZ
 ALTER TABLE erp_notifications ADD COLUMN IF NOT EXISTS customer_id UUID REFERENCES erp_customers(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_erp_customers_last_receipt ON erp_customers(last_receipt_date);
 
+-- Migration: Track weighted average buy cost per material (auto-updated by backend on every receipt)
+ALTER TABLE erp_materials ADD COLUMN IF NOT EXISTS avg_cost_per_unit DECIMAL(10,2) DEFAULT 0;
+
+
 -- =============================================================================
 -- BOOKINGS TABLE
 -- Household customer pickup appointment bookings (B2C inbound flow).
