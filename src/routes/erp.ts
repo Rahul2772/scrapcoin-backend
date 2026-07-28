@@ -87,6 +87,8 @@ const transactionSchema = z.object({
     price_per_unit: z.number().nonnegative(),
     gst_rate: z.number().min(0).max(100).optional().default(0),
   })).optional(),
+  // Optional: link to an existing sale batch (for edits)
+  sale_batch_id: z.string().uuid().optional().nullable(),
 });
 
 const purchaseReceiptSchema = z.object({
@@ -1070,7 +1072,42 @@ erpRouter.post("/transactions", async (req, res) => {
     let firstTxn: any = null;
     let firstInvoice: any = null;
 
-    // 4. Loop insert B2B items
+    // 4a. If multiple materials — create one sale batch to group them
+    let saleBatchId: string | null = null;
+    if (itemsToInsert.length > 1) {
+      const batchTotal = itemsToInsert.reduce((sum, item) => {
+        const subtotal = item.weight * item.price_per_unit;
+        const gst = (subtotal * (item.gst_rate ?? 0)) / 100;
+        return sum + subtotal + gst;
+      }, 0);
+
+      const { count: batchCount } = await supabase
+        .from("erp_sale_batches")
+        .select("*", { count: "exact", head: true });
+      const batchNumber = `BATCH-${String((batchCount || 0) + 1).padStart(5, "0")}`;
+
+      const { data: batch, error: batchErr } = await supabase
+        .from("erp_sale_batches")
+        .insert({
+          batch_number: batchNumber,
+          supplier_id,
+          total_amount: Number(batchTotal.toFixed(2)),
+          payment_status: payment_method ? "paid" : "pending",
+          payment_method: payment_method || null,
+          due_date: due_date || null,
+          paid_at: payment_method ? (created_at || new Date().toISOString()) : null,
+          notes: notes || null,
+          created_by: req.privilegedUser?.id || null,
+          ...(created_at ? { created_at } : {}),
+        })
+        .select()
+        .single();
+
+      if (batchErr) throw batchErr;
+      saleBatchId = batch.id;
+    }
+
+    // 4b. Loop insert B2B items
     for (let i = 0; i < itemsToInsert.length; i++) {
       const item = itemsToInsert[i];
 
@@ -1098,6 +1135,8 @@ erpRouter.post("/transactions", async (req, res) => {
         total_amount,
         notes,
         created_by: req.privilegedUser?.id,
+        // Link to batch if multi-material sale
+        ...(saleBatchId ? { sale_batch_id: saleBatchId } : {}),
       };
       if (created_at) {
         txnPayload.created_at = created_at;
@@ -1157,9 +1196,12 @@ erpRouter.post("/transactions", async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: "Scale transaction(s) recorded and invoice(s) created.",
+      message: itemsToInsert.length > 1
+        ? `Bulk sale batch ${saleBatchId ? "(BATCH created)" : ""} with ${itemsToInsert.length} materials recorded.`
+        : "Scale transaction recorded and invoice created.",
       transaction: firstTxn,
       invoice: firstInvoice,
+      sale_batch_id: saleBatchId,
     });
   } catch (err: any) {
     console.error("POST /api/erp/transactions error:", err);
@@ -1167,7 +1209,54 @@ erpRouter.post("/transactions", async (req, res) => {
   }
 });
 
-// PUT /api/erp/transactions/:id — Edit B2B scale transaction ticket
+// GET /api/erp/sale-batches — List all multi-material bulk sale batches
+erpRouter.get("/sale-batches", async (req, res) => {
+  try {
+    const { data: batches, error } = await supabase
+      .from("erp_sale_batches")
+      .select(`
+        *,
+        erp_suppliers(name, phone),
+        erp_transactions(id, txn_number, material_id, weight, unit, price_per_unit, total_amount,
+          erp_materials(name, category))
+      `)
+      .order("created_at", { ascending: false })
+      .limit(200);
+
+    if (error) throw error;
+
+    const formatted = (batches || []).map((b: any) => ({
+      id: b.id,
+      batch_number: b.batch_number,
+      supplier_id: b.supplier_id,
+      supplier_name: b.erp_suppliers?.name || "Unknown",
+      total_amount: Number(b.total_amount),
+      payment_status: b.payment_status,
+      payment_method: b.payment_method,
+      due_date: b.due_date,
+      paid_at: b.paid_at,
+      notes: b.notes,
+      created_at: b.created_at,
+      lines: (b.erp_transactions || []).map((t: any) => ({
+        txn_number: t.txn_number,
+        material_id: t.material_id,
+        material_name: t.erp_materials?.name || "",
+        material_category: t.erp_materials?.category || "",
+        weight: Number(t.weight),
+        unit: t.unit,
+        price_per_unit: Number(t.price_per_unit),
+        total_amount: Number(t.total_amount),
+      })),
+    }));
+
+    res.json({ success: true, count: formatted.length, batches: formatted });
+  } catch (err: any) {
+    console.error("GET /api/erp/sale-batches error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+
 erpRouter.put("/transactions/:id", async (req, res) => {
   const parsed = transactionSchema.safeParse(req.body);
   if (!parsed.success) {

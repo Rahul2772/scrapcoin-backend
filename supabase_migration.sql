@@ -174,6 +174,43 @@ CREATE INDEX IF NOT EXISTS idx_erp_customers_last_receipt ON erp_customers(last_
 -- Migration: Track weighted average buy cost per material (auto-updated by backend on every receipt)
 ALTER TABLE erp_materials ADD COLUMN IF NOT EXISTS avg_cost_per_unit DECIMAL(10,2) DEFAULT 0;
 
+-- Migration: erp_sale_batches — group multi-material B2B bulk sales under one batch
+-- Allows copper + aluminium + steel to be sold together at one negotiated price
+-- without splitting arbitrarily across separate unrelated transactions.
+CREATE TABLE IF NOT EXISTS erp_sale_batches (
+  id              UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  batch_number    VARCHAR(50)  UNIQUE NOT NULL,
+  supplier_id     UUID         REFERENCES erp_suppliers(id) ON DELETE SET NULL,
+  total_amount    DECIMAL(12,2) NOT NULL DEFAULT 0,
+  payment_status  VARCHAR(30)  DEFAULT 'pending'
+                    CHECK (payment_status IN ('pending','paid','overdue','cancelled')),
+  payment_method  VARCHAR(30),
+  due_date        DATE,
+  paid_at         TIMESTAMPTZ,
+  notes           TEXT,
+  created_by      UUID         REFERENCES auth.users(id) ON DELETE SET NULL,
+  created_at      TIMESTAMPTZ  DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ  DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_erp_sale_batches_supplier ON erp_sale_batches(supplier_id);
+CREATE INDEX IF NOT EXISTS idx_erp_sale_batches_created  ON erp_sale_batches(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_erp_sale_batches_status   ON erp_sale_batches(payment_status);
+
+-- Link each transaction line to a sale batch (nullable — single-material txns have no batch)
+ALTER TABLE erp_transactions
+  ADD COLUMN IF NOT EXISTS sale_batch_id UUID REFERENCES erp_sale_batches(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_erp_transactions_batch ON erp_transactions(sale_batch_id);
+
+-- RLS for the new table
+ALTER TABLE erp_sale_batches ENABLE ROW LEVEL SECURITY;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'erp_sale_batches' AND policyname = 'erp_authenticated_read') THEN
+    CREATE POLICY "erp_authenticated_read" ON erp_sale_batches FOR SELECT TO authenticated USING (true);
+  END IF;
+END $$;
+
 
 -- =============================================================================
 -- BOOKINGS TABLE
