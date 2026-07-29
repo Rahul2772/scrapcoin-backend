@@ -174,6 +174,13 @@ CREATE INDEX IF NOT EXISTS idx_erp_customers_last_receipt ON erp_customers(last_
 -- Migration: Track weighted average buy cost per material (auto-updated by backend on every receipt)
 ALTER TABLE erp_materials ADD COLUMN IF NOT EXISTS avg_cost_per_unit DECIMAL(10,2) DEFAULT 0;
 
+-- Migration §2.1: Store GPS coordinates captured via browser Geolocation API
+-- Enables champion navigation and future proximity-based routing
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS lat  DECIMAL(10,7);
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS lng  DECIMAL(10,7);
+CREATE INDEX IF NOT EXISTS idx_bookings_location ON bookings(lat, lng) WHERE lat IS NOT NULL;
+
+
 -- Migration: erp_sale_batches — group multi-material B2B bulk sales under one batch
 -- Allows copper + aluminium + steel to be sold together at one negotiated price
 -- without splitting arbitrarily across separate unrelated transactions.

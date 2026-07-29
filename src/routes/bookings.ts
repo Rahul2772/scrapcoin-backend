@@ -51,6 +51,9 @@ const bookingSchema = z.object({
   pincode: z.string().trim().regex(/^\d{6}$/, "Pincode must be 6 digits").optional(),
   pickupDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   materials: z.array(z.string().trim().min(1)).min(1),
+  // GPS coordinates captured via browser Geolocation API (optional)
+  lat: z.number().min(-90).max(90).optional().nullable(),
+  lng: z.number().min(-180).max(180).optional().nullable(),
 });
 
 const optionalDateSchema = z

@@ -112,6 +112,12 @@ export async function saveBooking(booking: Booking): Promise<Booking> {
   if (booking.pincode) {
     insertPayload.pincode = booking.pincode;
   }
+  if (booking.lat != null) {
+    insertPayload.lat = booking.lat;
+  }
+  if (booking.lng != null) {
+    insertPayload.lng = booking.lng;
+  }
   if (booking.userId) {
     insertPayload.user_id = booking.userId;
   }

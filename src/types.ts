@@ -28,6 +28,9 @@ export type Booking = {
   lastCommunicationDate?: string | null;
   statusComments?: string | null;
   source?: "website" | "whatsapp" | "admin";
+  // GPS coordinates from browser Geolocation API (optional)
+  lat?: number | null;
+  lng?: number | null;
 };
 
 export type LivePickupItem = {
