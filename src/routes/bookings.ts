@@ -5,6 +5,7 @@ import { z } from "zod";
 import { requireAdmin } from "../middleware/requireAdmin.js";
 import { requireAdminOrChampion } from "../middleware/requireAdminOrChampion.js";
 import { supabase } from "../lib/supabase.js";
+import { verifySupabaseToken } from "../lib/jwt.js";
 import { sendWhatsAppMessage, sendSMSMessage } from "../lib/twilio.js";
 import {
   getBookingById,
@@ -254,14 +255,18 @@ bookingsRouter.get("/me", async (req, res) => {
   }
 
   const token = authHeader.split(" ")[1];
-  const { data: userData, error: authError } = await supabase.auth.getUser(token);
 
-  if (authError || !userData.user) {
+  // Verify JWT using JWKS (supports both legacy HS256 and new ES256 Supabase keys)
+  let userId: string;
+  try {
+    const claims = await verifySupabaseToken(token);
+    userId = claims.sub;
+  } catch {
     return res.status(401).json({ error: "Invalid or expired token" });
   }
 
   try {
-    const bookings = await getBookings(userData.user.id);
+    const bookings = await getBookings(userId);
     return res.json(bookings);
   } catch (err) {
     console.error("GET /api/bookings/me error", err);

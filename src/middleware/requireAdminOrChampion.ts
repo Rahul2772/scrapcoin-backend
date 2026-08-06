@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import { supabase } from "../lib/supabase.js";
+import { verifySupabaseToken } from "../lib/jwt.js";
 
 export interface PrivilegedUser {
   id: string;
@@ -30,20 +31,21 @@ export async function requireAdminOrChampion(
 
   const token = authHeader.split(" ")[1];
 
-  // Verify JWT with Supabase
-  const { data: userData, error: authError } =
-    await supabase.auth.getUser(token);
-
-  if (authError || !userData.user) {
+  // Verify JWT using JWKS (supports both legacy HS256 and new ES256 Supabase keys)
+  let userId: string;
+  try {
+    const claims = await verifySupabaseToken(token);
+    userId = claims.sub;
+  } catch {
     res.status(401).json({ error: "Invalid or expired token" });
     return;
   }
 
-  // Check profile role
+  // Check profile role in database
   const { data: profile, error: profileError } = await supabase
     .from("profiles")
     .select("id, email, role")
-    .eq("id", userData.user.id)
+    .eq("id", userId)
     .single();
 
   if (profileError || !profile) {
