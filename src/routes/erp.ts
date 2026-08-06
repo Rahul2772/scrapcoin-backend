@@ -2380,68 +2380,103 @@ erpRouter.get("/whatsapp/logs", async (req, res) => {
 // ── 8. DASHBOARD ──────────────────────────────────────────────────────────────
 
 // GET /api/erp/dashboard — Aggregated dashboard statistics for charts & summaries
+// Query params:
+//   period:  "month" | "quarter" | "year"  (default: "month" rolling 30 days)
+//   year:    e.g. 2026                     (default: current year)
+//   month:   1–12                          (only for period=month; default: current month)
+//   quarter: 1–4                           (only for period=quarter; default: current quarter)
 erpRouter.get("/dashboard", async (req, res) => {
   try {
-    // 1. Calculations: rolling window — wider of calendar-month-start or last 30 days
-    // This means stats are always populated even when the month just started.
-    const calendarMonthStart = new Date();
-    calendarMonthStart.setDate(1);
-    calendarMonthStart.setHours(0, 0, 0, 0);
+    // ── Period resolution ──────────────────────────────────────────────────────
+    const period   = (req.query.period as string) || "month";
+    const now      = new Date();
+    const reqYear  = req.query.year    ? Number(req.query.year)    : now.getFullYear();
+    const reqMonth = req.query.month   ? Number(req.query.month)   : now.getMonth() + 1;
+    const reqQ     = req.query.quarter ? Number(req.query.quarter) : Math.ceil((now.getMonth() + 1) / 3);
 
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    let periodStart: Date;
+    let periodEnd: Date;
+    let periodLabel: string;
 
-    // Pick whichever window is wider (further in the past)
-    const startOfMonth = thirtyDaysAgo < calendarMonthStart ? thirtyDaysAgo : calendarMonthStart;
+    if (period === "year") {
+      periodStart = new Date(reqYear, 0, 1);
+      periodEnd   = new Date(reqYear + 1, 0, 1);
+      periodLabel = `FY ${reqYear}`;
+    } else if (period === "quarter") {
+      const qStart = (reqQ - 1) * 3;
+      periodStart  = new Date(reqYear, qStart, 1);
+      periodEnd    = new Date(reqYear, qStart + 3, 1);
+      const qNames = ["Jan–Mar", "Apr–Jun", "Jul–Sep", "Oct–Dec"];
+      periodLabel  = `Q${reqQ} ${reqYear} (${qNames[reqQ - 1]})`;
+    } else {
+      // month mode — rolling 30 days by default; explicit year+month = calendar month
+      if (req.query.year || req.query.month) {
+        periodStart = new Date(reqYear, reqMonth - 1, 1);
+        periodEnd   = new Date(reqYear, reqMonth, 1);
+        periodLabel = new Date(reqYear, reqMonth - 1, 1)
+          .toLocaleDateString("en-IN", { month: "long", year: "numeric" });
+      } else {
+        const calStart = new Date(now.getFullYear(), now.getMonth(), 1);
+        const rolling  = new Date(now);
+        rolling.setDate(rolling.getDate() - 30);
+        periodStart = rolling < calStart ? rolling : calStart;
+        periodEnd   = new Date(now);
+        periodEnd.setDate(periodEnd.getDate() + 1);
+        periodLabel = "Last 30 days";
+      }
+    }
 
-    const [{ data: txnsThisMonth, error: txnErr }, { data: buysThisMonth, error: buyErr }] = await Promise.all([
+    const startISO = periodStart.toISOString();
+    const endISO   = periodEnd.toISOString();
+
+    // ── 1. Stat card aggregates for selected period ────────────────────────────
+    const [{ data: txnsPeriod, error: txnErr }, { data: buysPeriod }] = await Promise.all([
       supabase
         .from("erp_transactions")
         .select("total_amount, weight")
-        .gte("created_at", startOfMonth.toISOString()),
+        .gte("created_at", startISO)
+        .lt("created_at", endISO),
       supabase
         .from("erp_purchase_receipts")
         .select("total_amount")
-        .gte("created_at", startOfMonth.toISOString()),
+        .gte("created_at", startISO)
+        .lt("created_at", endISO),
     ]);
 
     if (txnErr) throw txnErr;
-    // buyErr is non-fatal
 
-    const revenueThisMonth = (txnsThisMonth || []).reduce((sum, t) => sum + Number(t.total_amount), 0);
-    const weightThisMonth = (txnsThisMonth || []).reduce((sum, t) => sum + Number(t.weight), 0);
-    const txnsCountThisMonth = (txnsThisMonth || []).length;
+    const revenueThisMonth   = (txnsPeriod || []).reduce((s, t) => s + Number(t.total_amount), 0);
+    const weightThisMonth    = (txnsPeriod || []).reduce((s, t) => s + Number(t.weight), 0);
+    const txnsCountThisMonth = (txnsPeriod || []).length;
+    const buyCostThisMonth   = (buysPeriod || []).reduce((s, t) => s + Number(t.total_amount), 0);
 
-    // All-time buy data for COGS calculation (needed to compute avg buy price per material)
+    // All-time weighted avg buy price per material (for COGS)
     const { data: allBuys } = await supabase
       .from("erp_purchase_receipts")
       .select("material_id, weight, total_amount");
 
-    // Build avg buy price per material (all time weighted average)
     const avgBuyMap: Record<string, { total_cost: number; total_weight: number }> = {};
     (allBuys || []).forEach((r: any) => {
       if (!avgBuyMap[r.material_id]) avgBuyMap[r.material_id] = { total_cost: 0, total_weight: 0 };
-      avgBuyMap[r.material_id].total_cost += Number(r.total_amount);
+      avgBuyMap[r.material_id].total_cost   += Number(r.total_amount);
       avgBuyMap[r.material_id].total_weight += Number(r.weight);
     });
 
-    // COGS this month = sold_weight * avg_buy_price per material
-    const { data: txnsThisMonthDetail } = await supabase
+    const { data: txnsPeriodDetail } = await supabase
       .from("erp_transactions")
       .select("material_id, weight")
-      .gte("created_at", startOfMonth.toISOString());
+      .gte("created_at", startISO)
+      .lt("created_at", endISO);
 
-    const cogsThisMonth = (txnsThisMonthDetail || []).reduce((sum: number, t: any) => {
+    const cogsThisMonth = (txnsPeriodDetail || []).reduce((sum: number, t: any) => {
       const avg = avgBuyMap[t.material_id];
       const avgPrice = avg && avg.total_weight > 0 ? avg.total_cost / avg.total_weight : 0;
-      return sum + (Number(t.weight) * avgPrice);
+      return sum + Number(t.weight) * avgPrice;
     }, 0);
 
-    const buyCostThisMonth = (buysThisMonth || []).reduce((sum, t) => sum + Number(t.total_amount), 0);
-    // P&L = sell revenue this month minus COGS (cost of what was actually sold, not all purchases)
     const profitLoss = Number((revenueThisMonth - cogsThisMonth).toFixed(2));
 
-    // 2. Low stock alerts (materials where stock_qty <= min_threshold)
+    // ── 2. Low stock alerts ────────────────────────────────────────────────────
     const { data: lowStock, error: stockErr } = await supabase
       .from("erp_materials")
       .select("id, name, stock_qty, min_threshold, color_hex, unit")
@@ -2452,12 +2487,12 @@ erpRouter.get("/dashboard", async (req, res) => {
     const lowStockAlerts = (lowStock || [])
       .filter((m) => Number(m.stock_qty) <= Number(m.min_threshold))
       .sort((a, b) => {
-        const thresholdA = Number(a.min_threshold) || 1;
-        const thresholdB = Number(b.min_threshold) || 1;
-        return (Number(a.stock_qty) / thresholdA) - (Number(b.stock_qty) / thresholdB);
+        const tA = Number(a.min_threshold) || 1;
+        const tB = Number(b.min_threshold) || 1;
+        return Number(a.stock_qty) / tA - Number(b.stock_qty) / tB;
       });
 
-    // 3. Last 10 B2B transactions
+    // ── 3. Last 10 recent B2B transactions (always unfiltered) ────────────────
     const { data: recent, error: recentErr } = await supabase
       .from("erp_transactions")
       .select(`
@@ -2488,184 +2523,129 @@ erpRouter.get("/dashboard", async (req, res) => {
       };
     });
 
-    // 4. Invoices outstanding summary
+    // ── 4. Invoice summary (all-time) ─────────────────────────────────────────
     const { data: invoices, error: invErr } = await supabase.from("erp_invoices").select("status, amount");
     if (invErr) throw invErr;
 
-    const invoice_summary = {
-      pending_count: 0,
-      overdue_count: 0,
-      pending_amount: 0,
-      overdue_amount: 0,
-    };
-
+    const invoice_summary = { pending_count: 0, overdue_count: 0, pending_amount: 0, overdue_amount: 0 };
     (invoices || []).forEach((inv) => {
       const amt = Number(inv.amount);
-      if (inv.status === "pending") {
-        invoice_summary.pending_count++;
-        invoice_summary.pending_amount += amt;
-      } else if (inv.status === "overdue") {
-        invoice_summary.overdue_count++;
-        invoice_summary.overdue_amount += amt;
-      }
+      if (inv.status === "pending")      { invoice_summary.pending_count++; invoice_summary.pending_amount += amt; }
+      else if (inv.status === "overdue") { invoice_summary.overdue_count++; invoice_summary.overdue_amount += amt; }
     });
 
-    // 5. Monthly trend last 6 months — purchase (B2B erp_transactions) + sell (B2C erp_purchase_receipts)
+    // ── 5. 6-month monthly trend chart (fixed window, always) ─────────────────
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
 
-    const [{ data: trendsData, error: trendErr }, { data: sellTrendsData, error: sellTrendErr }] = await Promise.all([
-      supabase
-        .from("erp_transactions")
-        .select("total_amount, created_at")
-        .gte("created_at", sixMonthsAgo.toISOString()),
-      supabase
-        .from("erp_purchase_receipts")
-        .select("total_amount, created_at")
-        .gte("created_at", sixMonthsAgo.toISOString()),
+    const [{ data: trendsData, error: trendErr }, { data: sellTrendsData }] = await Promise.all([
+      supabase.from("erp_transactions").select("total_amount, created_at").gte("created_at", sixMonthsAgo.toISOString()),
+      supabase.from("erp_purchase_receipts").select("total_amount, created_at").gte("created_at", sixMonthsAgo.toISOString()),
     ]);
 
     if (trendErr) throw trendErr;
-    // sellTrendErr is non-fatal — sell data may be empty if table not populated
 
-    const monthsMap: Record<string, { purchase_revenue: number; sell_revenue: number; transaction_count: number }> = {};
+    // Key by YYYY-MM to avoid Dec/Jun collision across year boundary
+    const monthsMap: Record<string, { purchase_revenue: number; sell_revenue: number; transaction_count: number; label: string }> = {};
     const monthsOrder: string[] = [];
 
-    // Initialize past 6 months in order
     for (let i = 5; i >= 0; i--) {
-      const d = new Date();
+      const d   = new Date();
       d.setMonth(d.getMonth() - i);
+      const key   = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
       const label = d.toLocaleDateString("en-US", { month: "short" });
-      monthsMap[label] = { purchase_revenue: 0, sell_revenue: 0, transaction_count: 0 };
-      monthsOrder.push(label);
+      monthsMap[key] = { purchase_revenue: 0, sell_revenue: 0, transaction_count: 0, label };
+      monthsOrder.push(key);
     }
 
     (trendsData || []).forEach((t) => {
-      const label = new Date(t.created_at).toLocaleDateString("en-US", { month: "short" });
-      if (monthsMap[label]) {
-        monthsMap[label].purchase_revenue += Number(t.total_amount);
-        monthsMap[label].transaction_count++;
-      }
+      const d   = new Date(t.created_at);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      if (monthsMap[key]) { monthsMap[key].purchase_revenue += Number(t.total_amount); monthsMap[key].transaction_count++; }
     });
 
     (sellTrendsData || []).forEach((t) => {
-      const label = new Date(t.created_at).toLocaleDateString("en-US", { month: "short" });
-      if (monthsMap[label]) {
-        monthsMap[label].sell_revenue += Number(t.total_amount);
-      }
+      const d   = new Date(t.created_at);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      if (monthsMap[key]) monthsMap[key].sell_revenue += Number(t.total_amount);
     });
 
-    const monthly_trend = monthsOrder.map((month) => ({
-      month,
-      total_revenue: monthsMap[month].purchase_revenue,
-      purchase_revenue: monthsMap[month].purchase_revenue,
-      sell_revenue: monthsMap[month].sell_revenue,
-      transaction_count: monthsMap[month].transaction_count,
+    const monthly_trend = monthsOrder.map((key) => ({
+      month:             monthsMap[key].label,
+      total_revenue:     monthsMap[key].purchase_revenue,
+      purchase_revenue:  monthsMap[key].purchase_revenue,
+      sell_revenue:      monthsMap[key].sell_revenue,
+      transaction_count: monthsMap[key].transaction_count,
     }));
 
-    // 6. Top 5 materials by revenue this month
+    // ── 6. Top 5 materials by revenue in selected period ──────────────────────
     const { data: topMatsData, error: topMatsErr } = await supabase
       .from("erp_transactions")
       .select("total_amount, weight, erp_materials(name, color_hex)")
-      .gte("created_at", startOfMonth.toISOString());
+      .gte("created_at", startISO)
+      .lt("created_at", endISO);
 
     if (topMatsErr) throw topMatsErr;
 
-    const materialsRevenueMap: Record<string, { name: string; color_hex: string; revenue: number; weight_collected: number }> = {};
+    const matRevMap: Record<string, { name: string; color_hex: string; revenue: number; weight_collected: number }> = {};
     (topMatsData || []).forEach((t: any) => {
       const name = t.erp_materials?.name;
       if (name) {
-        if (!materialsRevenueMap[name]) {
-          materialsRevenueMap[name] = {
-            name,
-            color_hex: t.erp_materials.color_hex || "#f5a623",
-            revenue: 0,
-            weight_collected: 0,
-          };
-        }
-        materialsRevenueMap[name].revenue += Number(t.total_amount);
-        materialsRevenueMap[name].weight_collected += Number(t.weight);
+        if (!matRevMap[name]) matRevMap[name] = { name, color_hex: t.erp_materials.color_hex || "#f5a623", revenue: 0, weight_collected: 0 };
+        matRevMap[name].revenue          += Number(t.total_amount);
+        matRevMap[name].weight_collected += Number(t.weight);
       }
     });
 
-    const top_materials = Object.values(materialsRevenueMap)
+    const top_materials = Object.values(matRevMap)
       .sort((a, b) => b.revenue - a.revenue)
       .slice(0, 5);
 
-    // 7. Material-wise Profit & Loss (all time)
+    // ── 7. Material P&L (all-time) ────────────────────────────────────────────
     const [{ data: allReceipts }, { data: allTxns }] = await Promise.all([
-      supabase
-        .from("erp_purchase_receipts")
-        .select("material_id, weight, total_amount, erp_materials(name, color_hex)"),
-      supabase
-        .from("erp_transactions")
-        .select("material_id, weight, total_amount, erp_materials(name, color_hex)"),
+      supabase.from("erp_purchase_receipts").select("material_id, weight, total_amount, erp_materials(name, color_hex)"),
+      supabase.from("erp_transactions").select("material_id, weight, total_amount, erp_materials(name, color_hex)"),
     ]);
 
-    const pnlMap: Record<string, {
-      material_id: string;
-      material_name: string;
-      color_hex: string;
-      buy_weight: number;
-      buy_cost: number;
-      sell_weight: number;
-      sell_revenue: number;
-    }> = {};
+    const pnlMap: Record<string, { material_id: string; material_name: string; color_hex: string; buy_weight: number; buy_cost: number; sell_weight: number; sell_revenue: number }> = {};
 
     (allReceipts || []).forEach((r: any) => {
-      const id = r.material_id;
-      const name = r.erp_materials?.name || "Unknown";
-      const color = r.erp_materials?.color_hex || "#ccc";
+      const id = r.material_id; const name = r.erp_materials?.name || "Unknown"; const color = r.erp_materials?.color_hex || "#ccc";
       if (!pnlMap[id]) pnlMap[id] = { material_id: id, material_name: name, color_hex: color, buy_weight: 0, buy_cost: 0, sell_weight: 0, sell_revenue: 0 };
-      pnlMap[id].buy_weight += Number(r.weight);
-      pnlMap[id].buy_cost += Number(r.total_amount);
+      pnlMap[id].buy_weight += Number(r.weight); pnlMap[id].buy_cost += Number(r.total_amount);
     });
 
     (allTxns || []).forEach((t: any) => {
-      const id = t.material_id;
-      const name = t.erp_materials?.name || "Unknown";
-      const color = t.erp_materials?.color_hex || "#ccc";
+      const id = t.material_id; const name = t.erp_materials?.name || "Unknown"; const color = t.erp_materials?.color_hex || "#ccc";
       if (!pnlMap[id]) pnlMap[id] = { material_id: id, material_name: name, color_hex: color, buy_weight: 0, buy_cost: 0, sell_weight: 0, sell_revenue: 0 };
-      pnlMap[id].sell_weight += Number(t.weight);
-      pnlMap[id].sell_revenue += Number(t.total_amount);
+      pnlMap[id].sell_weight += Number(t.weight); pnlMap[id].sell_revenue += Number(t.total_amount);
     });
 
-    const material_pnl = Object.values(pnlMap)
-      .map((m) => {
-        const unsold_weight = Math.max(0, m.buy_weight - m.sell_weight);
-        // Average price paid per unit when buying from customers
-        const avg_buy_price = m.buy_weight > 0 ? m.buy_cost / m.buy_weight : 0;
-        // Cost of Goods Sold — only the portion of buy cost attributable to what was sold
-        const cogs = Number((m.sell_weight * avg_buy_price).toFixed(2));
-        // Profit/Loss only on sold quantity — unsold stock stays as inventory, not a loss
-        const profit_loss = Number((m.sell_revenue - cogs).toFixed(2));
-        // Inventory value — buy cost of unsold stock (asset)
-        const inventory_value = Number((unsold_weight * avg_buy_price).toFixed(2));
-        // Profit margin percentage on cost (COGS)
-        const profit_margin_pct = cogs > 0 ? Number(((profit_loss / cogs) * 100).toFixed(1)) : 0;
-        return {
-          ...m,
-          avg_buy_price: Number(avg_buy_price.toFixed(2)),
-          cogs,
-          profit_loss,
-          profit_margin_pct,
-          unsold_weight,
-          inventory_value,
-        };
-      })
-      .sort((a, b) => b.profit_loss - a.profit_loss);
+    const material_pnl = Object.values(pnlMap).map((m) => {
+      const unsold_weight     = Math.max(0, m.buy_weight - m.sell_weight);
+      const avg_buy_price     = m.buy_weight > 0 ? m.buy_cost / m.buy_weight : 0;
+      const cogs              = Number((m.sell_weight * avg_buy_price).toFixed(2));
+      const profit_loss       = Number((m.sell_revenue - cogs).toFixed(2));
+      const inventory_value   = Number((unsold_weight * avg_buy_price).toFixed(2));
+      const profit_margin_pct = cogs > 0 ? Number(((profit_loss / cogs) * 100).toFixed(1)) : 0;
+      return { ...m, avg_buy_price: Number(avg_buy_price.toFixed(2)), cogs, profit_loss, profit_margin_pct, unsold_weight, inventory_value };
+    }).sort((a, b) => b.profit_loss - a.profit_loss);
 
+    // ── Response ──────────────────────────────────────────────────────────────
     res.json({
       success: true,
       dashboard: {
         revenue: {
-          revenue_this_month: revenueThisMonth,
-          weight_this_month: weightThisMonth,
+          revenue_this_month:   revenueThisMonth,
+          weight_this_month:    weightThisMonth,
           txn_count_this_month: txnsCountThisMonth,
-          buy_cost_this_month: buyCostThisMonth,
-          profit_loss: profitLoss,
+          buy_cost_this_month:  buyCostThisMonth,
+          profit_loss:          profitLoss,
+          period_label:         periodLabel,
+          period_start:         startISO,
+          period_end:           endISO,
         },
-        low_stock_alerts: lowStockAlerts,
+        low_stock_alerts:    lowStockAlerts,
         recent_transactions: formattedRecent,
         monthly_trend,
         top_materials,
