@@ -2344,7 +2344,6 @@ erpRouter.post("/whatsapp/send/:transactionId", async (req, res) => {
   }
 });
 
-// GET /api/erp/whatsapp/logs — List dispatch logs
 erpRouter.get("/whatsapp/logs", async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -2383,10 +2382,17 @@ erpRouter.get("/whatsapp/logs", async (req, res) => {
 // GET /api/erp/dashboard — Aggregated dashboard statistics for charts & summaries
 erpRouter.get("/dashboard", async (req, res) => {
   try {
-    // 1. Calculations: Total collected revenue & weights this month
-    const startOfMonth = new Date();
-    startOfMonth.setDate(1);
-    startOfMonth.setHours(0, 0, 0, 0);
+    // 1. Calculations: rolling window — wider of calendar-month-start or last 30 days
+    // This means stats are always populated even when the month just started.
+    const calendarMonthStart = new Date();
+    calendarMonthStart.setDate(1);
+    calendarMonthStart.setHours(0, 0, 0, 0);
+
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    // Pick whichever window is wider (further in the past)
+    const startOfMonth = thirtyDaysAgo < calendarMonthStart ? thirtyDaysAgo : calendarMonthStart;
 
     const [{ data: txnsThisMonth, error: txnErr }, { data: buysThisMonth, error: buyErr }] = await Promise.all([
       supabase
