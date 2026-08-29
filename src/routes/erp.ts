@@ -2438,17 +2438,18 @@ erpRouter.get("/dashboard", async (req, res) => {
         .lt("created_at", endISO),
       supabase
         .from("erp_purchase_receipts")
-        .select("total_amount")
+        .select("total_amount, weight")
         .gte("created_at", startISO)
         .lt("created_at", endISO),
     ]);
 
     if (txnErr) throw txnErr;
 
-    const revenueThisMonth   = (txnsPeriod || []).reduce((s, t) => s + Number(t.total_amount), 0);
-    const weightThisMonth    = (txnsPeriod || []).reduce((s, t) => s + Number(t.weight), 0);
-    const txnsCountThisMonth = (txnsPeriod || []).length;
-    const buyCostThisMonth   = (buysPeriod || []).reduce((s, t) => s + Number(t.total_amount), 0);
+    const revenueThisMonth       = (txnsPeriod || []).reduce((s, t) => s + Number(t.total_amount), 0);
+    const weightSoldThisMonth    = (txnsPeriod || []).reduce((s, t) => s + Number(t.weight), 0);
+    const txnsCountThisMonth     = (txnsPeriod || []).length;
+    const buyCostThisMonth       = (buysPeriod || []).reduce((s, t) => s + Number(t.total_amount), 0);
+    const weightCollectedThisMonth = (buysPeriod || []).reduce((s, t) => s + Number((t as any).weight), 0);
 
     // All-time weighted avg buy price per material (for COGS)
     const { data: allBuys } = await supabase
@@ -2636,14 +2637,15 @@ erpRouter.get("/dashboard", async (req, res) => {
       success: true,
       dashboard: {
         revenue: {
-          revenue_this_month:   revenueThisMonth,
-          weight_this_month:    weightThisMonth,
-          txn_count_this_month: txnsCountThisMonth,
-          buy_cost_this_month:  buyCostThisMonth,
-          profit_loss:          profitLoss,
-          period_label:         periodLabel,
-          period_start:         startISO,
-          period_end:           endISO,
+          revenue_this_month:        revenueThisMonth,
+          weight_this_month:         weightCollectedThisMonth,
+          weight_sold_this_month:    weightSoldThisMonth,
+          txn_count_this_month:      txnsCountThisMonth,
+          buy_cost_this_month:       buyCostThisMonth,
+          profit_loss:               profitLoss,
+          period_label:              periodLabel,
+          period_start:              startISO,
+          period_end:                endISO,
         },
         low_stock_alerts:    lowStockAlerts,
         recent_transactions: formattedRecent,
