@@ -14,6 +14,35 @@ import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const pdfParse = require("pdf-parse");
 
+function render_page(pageData: any) {
+  let render_options = { normalizeWhitespace: false, disableCombineTextItems: false };
+  return pageData.getTextContent(render_options).then(function(textContent: any) {
+      let lastY = -1;
+      let lastX = -1;
+      let lastW = 0;
+      let text = '';
+      for (let item of textContent.items) {
+          let currentX = item.transform[4];
+          let currentY = item.transform[5];
+          let width = item.width;
+          
+          if (lastY == currentY || !lastY) {
+              if (lastX !== -1 && (currentX - (lastX + lastW)) > 5) {
+                  text += ' ' + item.str;
+              } else {
+                  text += item.str;
+              }
+          } else {
+              text += '\n' + item.str;
+          }
+          lastY = currentY;
+          lastX = currentX;
+          lastW = width;
+      }
+      return text;
+  });
+}
+
 export const telegramRouter = Router();
 
 // ── Env vars ──────────────────────────────────────────────────────────────────
@@ -224,7 +253,7 @@ telegramRouter.post("/webhook", async (req: Request, res: Response): Promise<voi
     let parsed: Record<string, any> = {};
     let parseFailed = false;
     try {
-      const pdfData = await pdfParse(pdfBuffer);
+      const pdfData = await pdfParse(pdfBuffer, { pagerender: render_page });
       rawText = pdfData.text ?? "";
       parsed  = parseReceiptText(rawText);
     } catch (parseErr) {
