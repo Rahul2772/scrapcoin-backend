@@ -120,7 +120,7 @@ function parseReceiptText(text: string): Record<string, any> {
     }
     // Look for a 10-digit mobile nearby
     for (let i = billFromIdx + 1; i <= Math.min(billFromIdx + 5, lines.length - 1); i++) {
-      const mobileMatch = lines[i].match(/(?:\+91[-\s]?)?([6-9]\d{9})/);
+      const mobileMatch = lines[i].match(/(?:\+91[-\s]?)?(\d{10})/);
       if (mobileMatch) {
         result.customer_mobile = mobileMatch[1];
         break;
@@ -129,7 +129,7 @@ function parseReceiptText(text: string): Record<string, any> {
   }
   // Fallback: scan whole text for mobile
   if (!result.customer_mobile) {
-    const mobileMatch = text.match(/(?:\+91[-\s]?)?([6-9]\d{9})/);
+    const mobileMatch = text.match(/(?:\+91[-\s]?)?(\d{10})/);
     if (mobileMatch) result.customer_mobile = mobileMatch[1];
   }
 
@@ -417,6 +417,71 @@ telegramRouter.patch(
       const { id } = req.params;
       const adminId = req.privilegedUser?.id;
 
+      // 1. Fetch the telegram receipt
+      const { data: tgReceipt, error: fetchErr } = await supabase
+        .from("telegram_ingested_receipts")
+        .select("*")
+        .eq("id", id)
+        .single();
+
+      if (fetchErr || !tgReceipt) throw new Error("Receipt not found.");
+      if (tgReceipt.status === "verified") return; // already verified
+      
+      const lineItems = tgReceipt.line_items || [];
+      if (!Array.isArray(lineItems) || lineItems.length === 0) {
+        throw new Error("Cannot verify an unreadable receipt with no items. Please manually create a scale ticket.");
+      }
+
+      // 2. Map line items to material IDs
+      const { data: allMaterials, error: matErr } = await supabase
+        .from("erp_materials")
+        .select("id, name");
+      
+      if (matErr || !allMaterials) throw new Error("Failed to fetch materials catalog.");
+
+      const newReceiptRows = [];
+      const invoiceNo = tgReceipt.purchase_no ? `TG-${tgReceipt.purchase_no}` : `TG-${id.split('-')[0]}`;
+
+      for (const item of lineItems) {
+        if (!item.item_name) continue;
+        const normalizedName = item.item_name.trim().toLowerCase();
+        
+        const matchedMaterial = allMaterials.find(m => m.name.toLowerCase() === normalizedName);
+        if (!matchedMaterial) {
+          throw new Error(`Material '${item.item_name}' not found in the ERP catalog. Please add it first.`);
+        }
+
+        newReceiptRows.push({
+          receipt_number: `${invoiceNo}-${item.sno || Math.floor(Math.random()*1000)}`,
+          customer_id:    tgReceipt.customer_id,
+          material_id:    matchedMaterial.id,
+          weight:         item.qty || 0,
+          unit:           "kg",
+          price_per_unit: item.rate || 0,
+          total_amount:   item.amount || 0,
+          payment_method: tgReceipt.payment_mode || "cash",
+          notes:          "Auto-generated from Telegram receipt",
+          created_by:     adminId,
+          created_at:     tgReceipt.purchase_date ? new Date(tgReceipt.purchase_date).toISOString() : new Date().toISOString()
+        });
+      }
+
+      // 3. Insert into erp_purchase_receipts
+      if (newReceiptRows.length > 0) {
+        const { error: insertErr } = await supabase
+          .from("erp_purchase_receipts")
+          .insert(newReceiptRows);
+        
+        if (insertErr) {
+          if (insertErr.code === '23505') {
+             // Unique violation on receipt_number, which might happen if already verified manually
+             throw new Error("These receipt numbers already exist. It might have been verified already.");
+          }
+          throw new Error("Failed to create ERP receipt: " + insertErr.message);
+        }
+      }
+
+      // 4. Mark as verified
       const { error } = await supabase
         .from("telegram_ingested_receipts")
         .update({
@@ -427,7 +492,7 @@ telegramRouter.patch(
         .eq("id", id);
 
       if (error) throw error;
-      res.json({ success: true, message: "Receipt verified." });
+      res.json({ success: true, message: "Receipt verified and added to main ERP." });
     } catch (err: any) {
       res.status(500).json({ success: false, message: err.message });
     }
