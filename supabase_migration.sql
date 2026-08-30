@@ -349,9 +349,68 @@ DO $$ BEGIN
 END $$;
 
 
+
+
 -- NOTE: No INSERT/UPDATE/DELETE policies are created for authenticated users.
--- All writes go through the backend (service_role key bypasses RLS).
--- Anon (unauthenticated) users have zero access to any ERP table.
+-- All writes go through the backend (service_role key bypasses RLS).\n-- Anon (unauthenticated) users have zero access to any ERP table.
 
 
+-- =============================================================================
+-- TELEGRAM RECEIPT INGESTION
+-- Stores PDF receipts received via Telegram bot, pending admin verification
+-- before they count in dashboard totals.
+-- =============================================================================
 
+-- Migration: Track how a B2C customer was created (manual vs telegram auto-import)
+ALTER TABLE erp_customers ADD COLUMN IF NOT EXISTS created_via VARCHAR(30) DEFAULT 'manual'
+  CHECK (created_via IN ('manual', 'booking', 'telegram_auto'));
+
+-- New table: telegram_ingested_receipts
+CREATE TABLE IF NOT EXISTS telegram_ingested_receipts (
+  id                 UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  source             VARCHAR(20)   NOT NULL DEFAULT 'telegram',
+  status             VARCHAR(20)   NOT NULL DEFAULT 'pending_review'
+                       CHECK (status IN ('pending_review', 'verified', 'rejected')),
+  customer_id        UUID          REFERENCES erp_customers(id) ON DELETE SET NULL,
+
+  -- Fields extracted from PDF
+  purchase_no        VARCHAR(50),
+  purchase_date      DATE,
+  customer_name      VARCHAR(255),
+  customer_mobile    VARCHAR(30),
+  customer_address   TEXT,
+  line_items         JSONB         NOT NULL DEFAULT '[]',
+  subtotal_amount    NUMERIC(14,2),
+  total_amount       NUMERIC(14,2),
+  paid_amount        NUMERIC(14,2),
+  balance            NUMERIC(14,2),
+  payment_mode       VARCHAR(50),
+  notes              TEXT,
+
+  -- Audit trail
+  raw_extracted_text TEXT,
+  pdf_storage_path   TEXT,
+
+  -- Review fields
+  verified_by        UUID          REFERENCES auth.users(id) ON DELETE SET NULL,
+  verified_at        TIMESTAMPTZ,
+  reject_reason      TEXT,
+
+  created_at         TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tgreceipts_status     ON telegram_ingested_receipts(status);
+CREATE INDEX IF NOT EXISTS idx_tgreceipts_customer   ON telegram_ingested_receipts(customer_id);
+CREATE INDEX IF NOT EXISTS idx_tgreceipts_created    ON telegram_ingested_receipts(created_at DESC);
+
+-- RLS: backend (service_role) writes; authenticated admins can read
+ALTER TABLE telegram_ingested_receipts ENABLE ROW LEVEL SECURITY;
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE tablename = 'telegram_ingested_receipts' AND policyname = 'tgreceipts_authenticated_read'
+  ) THEN
+    CREATE POLICY "tgreceipts_authenticated_read"
+      ON telegram_ingested_receipts FOR SELECT TO authenticated USING (true);
+  END IF;
+END $$;
