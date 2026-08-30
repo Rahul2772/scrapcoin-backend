@@ -438,7 +438,8 @@ telegramRouter.patch(
       if (matErr || !allMaterials) throw new Error("Failed to fetch materials catalog.");
 
       const newReceiptRows = [];
-      const invoiceNo = tgReceipt.purchase_no ? `TG-${tgReceipt.purchase_no}` : `TG-${id.split('-')[0]}`;
+      const invoiceNo = tgReceipt.purchase_no ? `TG-${tgReceipt.purchase_no}` : `TG-${String(id).split('-')[0]}`;
+
       const skippedMaterials: string[] = [];
 
       for (const item of lineItems) {
