@@ -2445,11 +2445,12 @@ erpRouter.get("/dashboard", async (req, res) => {
 
     if (txnErr) throw txnErr;
 
-    const revenueThisMonth       = (txnsPeriod || []).reduce((s, t) => s + Number(t.total_amount), 0);
-    const weightSoldThisMonth    = (txnsPeriod || []).reduce((s, t) => s + Number(t.weight), 0);
-    const txnsCountThisMonth     = (txnsPeriod || []).length;
-    const buyCostThisMonth       = (buysPeriod || []).reduce((s, t) => s + Number(t.total_amount), 0);
+    const revenueThisMonth         = (txnsPeriod || []).reduce((s, t) => s + Number(t.total_amount), 0);
+    const weightSoldThisMonth      = (txnsPeriod || []).reduce((s, t) => s + Number(t.weight), 0);
+    const txnsCountThisMonth       = (txnsPeriod || []).length;                          // B2B scale entries
+    const buyCostThisMonth         = (buysPeriod || []).reduce((s, t) => s + Number(t.total_amount), 0);
     const weightCollectedThisMonth = (buysPeriod || []).reduce((s, t) => s + Number((t as any).weight), 0);
+    const receiptCountThisMonth    = (buysPeriod || []).length;                          // B2C collections
 
     // All-time weighted avg buy price per material (for COGS)
     const { data: allBuys } = await supabase
@@ -2640,7 +2641,8 @@ erpRouter.get("/dashboard", async (req, res) => {
           revenue_this_month:        revenueThisMonth,
           weight_this_month:         weightCollectedThisMonth,
           weight_sold_this_month:    weightSoldThisMonth,
-          txn_count_this_month:      txnsCountThisMonth,
+          txn_count_this_month:      txnsCountThisMonth,       // B2B scale entries
+          receipt_count_this_month:  receiptCountThisMonth,    // B2C collections done
           buy_cost_this_month:       buyCostThisMonth,
           profit_loss:               profitLoss,
           period_label:              periodLabel,
