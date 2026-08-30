@@ -113,25 +113,23 @@ function parseReceiptText(text: string): Record<string, any> {
   // Receipt says "Bill From" or "Bill To" section
   const billFromIdx = lines.findIndex((l) => /bill\s+(from|to)/i.test(l));
   if (billFromIdx !== -1) {
-    // Next non-empty line after "Bill From" is likely the name
+    // Next non-empty line after "BILL TO" is the customer name
     const nameLine = lines[billFromIdx + 1];
-    if (nameLine && !/mobile|phone|address|₹|\d{10}/i.test(nameLine)) {
+    if (nameLine && !/mobile|phone|address|₹/i.test(nameLine)) {
       result.customer_name = nameLine;
     }
-    // Look for a 10-digit mobile nearby
+    // Look for a 10-digit mobile in the BILL TO section (within 5 lines)
     for (let i = billFromIdx + 1; i <= Math.min(billFromIdx + 5, lines.length - 1); i++) {
-      const mobileMatch = lines[i].match(/(?:\+91[-\s]?)?(\d{10})/);
+      // Strip known label prefixes like "Mobile :" or "Phone:" before matching
+      const cleanLine = lines[i].replace(/^(mobile|phone)\s*[:\-]?\s*/i, '');
+      const mobileMatch = cleanLine.match(/(\d{10})/);
       if (mobileMatch) {
         result.customer_mobile = mobileMatch[1];
         break;
       }
     }
   }
-  // Fallback: scan whole text for mobile
-  if (!result.customer_mobile) {
-    const mobileMatch = text.match(/(?:\+91[-\s]?)?(\d{10})/);
-    if (mobileMatch) result.customer_mobile = mobileMatch[1];
-  }
+  // NOTE: No global fallback scan — it would pick up The Scrap Co.'s own business number
 
   // ── Address (optional) ────────────────────────────────────────────────────
   const addrMatch = text.match(/Address\s*[:\-]?\s*(.+)/i);
@@ -441,14 +439,23 @@ telegramRouter.patch(
 
       const newReceiptRows = [];
       const invoiceNo = tgReceipt.purchase_no ? `TG-${tgReceipt.purchase_no}` : `TG-${id.split('-')[0]}`;
+      const skippedMaterials: string[] = [];
 
       for (const item of lineItems) {
         if (!item.item_name) continue;
         const normalizedName = item.item_name.trim().toLowerCase();
         
-        const matchedMaterial = allMaterials.find(m => m.name.toLowerCase() === normalizedName);
+        // Try exact match first, then partial/contains match
+        let matchedMaterial = allMaterials.find(m => m.name.toLowerCase() === normalizedName);
         if (!matchedMaterial) {
-          throw new Error(`Material '${item.item_name}' not found in the ERP catalog. Please add it first.`);
+          // Try: does the ERP material name appear inside the PDF item name? e.g. "NEWSPAPERS" vs "Books/Notebooks/Papers"
+          matchedMaterial = allMaterials.find(m => normalizedName.includes(m.name.toLowerCase()) || m.name.toLowerCase().includes(normalizedName));
+        }
+        
+        if (!matchedMaterial) {
+          // Skip this item with a warning instead of blocking the entire operation
+          skippedMaterials.push(item.item_name);
+          continue;
         }
 
         newReceiptRows.push({
@@ -464,6 +471,10 @@ telegramRouter.patch(
           created_by:     adminId,
           created_at:     tgReceipt.purchase_date ? new Date(tgReceipt.purchase_date).toISOString() : new Date().toISOString()
         });
+      }
+
+      if (newReceiptRows.length === 0 && lineItems.length > 0) {
+        throw new Error(`No materials matched: [${lineItems.map((i: any) => i.item_name).join(', ')}]. Please add them to the ERP Materials catalog first.`);
       }
 
       // 3. Insert into erp_purchase_receipts
@@ -492,7 +503,10 @@ telegramRouter.patch(
         .eq("id", id);
 
       if (error) throw error;
-      res.json({ success: true, message: "Receipt verified and added to main ERP." });
+      const skipNote = skippedMaterials.length > 0
+        ? ` (${skippedMaterials.length} item(s) skipped — not found in catalog: ${skippedMaterials.join(', ')})`
+        : '';
+      res.json({ success: true, message: `Receipt verified and ${newReceiptRows.length} item(s) added to main ERP.${skipNote}` });
     } catch (err: any) {
       res.status(500).json({ success: false, message: err.message });
     }
