@@ -67,7 +67,7 @@ function parseReceiptText(text: string): Record<string, any> {
   };
 
   // ── Purchase No ─────────────────────────────────────────────────────────────
-  const purchaseNoMatch = text.match(/Purchase\s*No\.?\s*[:\-]?\s*([\w\-]+)/i);
+  const purchaseNoMatch = text.match(/(?:Purchase|Invoice)\s*No\.?\s*[:\-]?\s*([\w\-]+)/i);
   if (purchaseNoMatch) result.purchase_no = purchaseNoMatch[1].trim();
 
   // ── Date ─────────────────────────────────────────────────────────────────────
@@ -81,8 +81,8 @@ function parseReceiptText(text: string): Record<string, any> {
   }
 
   // ── Customer Name & Mobile ────────────────────────────────────────────────
-  // Receipt says "Bill From" section
-  const billFromIdx = lines.findIndex((l) => /bill\s+from/i.test(l));
+  // Receipt says "Bill From" or "Bill To" section
+  const billFromIdx = lines.findIndex((l) => /bill\s+(from|to)/i.test(l));
   if (billFromIdx !== -1) {
     // Next non-empty line after "Bill From" is likely the name
     const nameLine = lines[billFromIdx + 1];
@@ -222,17 +222,14 @@ telegramRouter.post("/webhook", async (req: Request, res: Response): Promise<voi
     // Phase 5 — Parse PDF
     let rawText = "";
     let parsed: Record<string, any> = {};
+    let parseFailed = false;
     try {
       const pdfData = await pdfParse(pdfBuffer);
       rawText = pdfData.text ?? "";
       parsed  = parseReceiptText(rawText);
     } catch (parseErr) {
       console.error("[Telegram] PDF parse error:", parseErr);
-      await sendTelegramMessage(
-        chatId,
-        "⚠️ Could not read the PDF text. The receipt has been flagged for manual entry."
-      );
-      // Still insert with empty parsed data so admin can see it
+      parseFailed = true;
     }
 
     const highConf = isHighConfidence(parsed);
@@ -328,23 +325,30 @@ telegramRouter.post("/webhook", async (req: Request, res: Response): Promise<voi
     }
 
     // Phase 9 — Reply to sender
-    const amtStr     = parsed.total_amount != null ? `₹${parsed.total_amount.toLocaleString("en-IN")}` : "amount unknown";
-    const itemsStr   = parsed.line_items?.length ? `${parsed.line_items.length} item(s)` : "items unreadable";
-    const custStr    = parsed.customer_name ?? "Unknown customer";
-    const custStatus = customerStatus === "matched"
-      ? "(existing customer)"
-      : customerStatus === "created"
-      ? "(⚠️ NEW customer — admin will verify)"
-      : "(customer not matched)";
-    const confNote   = highConf ? "" : "\n⚠️ <i>Low confidence parse — admin review required.</i>";
+    if (parseFailed) {
+      await sendTelegramMessage(
+        chatId,
+        "⚠️ Could not read the PDF text. The receipt has been saved and flagged for manual admin entry."
+      );
+    } else {
+      const amtStr     = parsed.total_amount != null ? `₹${parsed.total_amount.toLocaleString("en-IN")}` : "amount unknown";
+      const itemsStr   = parsed.line_items?.length ? `${parsed.line_items.length} item(s)` : "items unreadable";
+      const custStr    = parsed.customer_name ?? "Unknown customer";
+      const custStatus = customerStatus === "matched"
+        ? "(existing customer)"
+        : customerStatus === "created"
+        ? "(⚠️ NEW customer — admin will verify)"
+        : "(customer not matched)";
+      const confNote   = highConf ? "" : "\n⚠️ <i>Low confidence parse — admin review required.</i>";
 
-    await sendTelegramMessage(
-      chatId,
-      `✅ Receipt logged (pending verification)\n` +
-      `Amount: <b>${amtStr}</b> — ${itemsStr}\n` +
-      `Customer: <b>${custStr}</b> ${custStatus}` +
-      confNote
-    );
+      await sendTelegramMessage(
+        chatId,
+        `✅ Receipt logged (pending verification)\n` +
+        `Amount: <b>${amtStr}</b> — ${itemsStr}\n` +
+        `Customer: <b>${custStr}</b> ${custStatus}` +
+        confNote
+      );
+    }
   } catch (err: any) {
     console.error("[Telegram] Webhook processing error:", err?.message ?? err);
   }
