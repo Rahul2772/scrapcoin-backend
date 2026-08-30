@@ -2433,12 +2433,12 @@ erpRouter.get("/dashboard", async (req, res) => {
     const [{ data: txnsPeriod, error: txnErr }, { data: buysPeriod }] = await Promise.all([
       supabase
         .from("erp_transactions")
-        .select("total_amount, weight")
+        .select("total_amount, weight, txn_number")
         .gte("created_at", startISO)
         .lt("created_at", endISO),
       supabase
         .from("erp_purchase_receipts")
-        .select("total_amount, weight")
+        .select("total_amount, weight, receipt_number")
         .gte("created_at", startISO)
         .lt("created_at", endISO),
     ]);
@@ -2447,10 +2447,12 @@ erpRouter.get("/dashboard", async (req, res) => {
 
     const revenueThisMonth         = (txnsPeriod || []).reduce((s, t) => s + Number(t.total_amount), 0);
     const weightSoldThisMonth      = (txnsPeriod || []).reduce((s, t) => s + Number(t.weight), 0);
-    const txnsCountThisMonth       = (txnsPeriod || []).length;                          // B2B scale entries
+    // Count distinct base txn numbers (TXN-00007/1 + TXN-00007/2 = 1 scale entry)
+    const txnsCountThisMonth       = new Set((txnsPeriod || []).map((t: any) => (t.txn_number as string).split("/")[0])).size;
     const buyCostThisMonth         = (buysPeriod || []).reduce((s, t) => s + Number(t.total_amount), 0);
     const weightCollectedThisMonth = (buysPeriod || []).reduce((s, t) => s + Number((t as any).weight), 0);
-    const receiptCountThisMonth    = (buysPeriod || []).length;                          // B2C collections
+    // Count distinct base receipt numbers (RCP-1035/1 + RCP-1035/2 = 1 collection)
+    const receiptCountThisMonth    = new Set((buysPeriod || []).map((t: any) => (t.receipt_number as string).split("/")[0])).size;
 
     // All-time weighted avg buy price per material (for COGS)
     const { data: allBuys } = await supabase
