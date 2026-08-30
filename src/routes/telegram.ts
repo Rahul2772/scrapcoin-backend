@@ -441,6 +441,8 @@ telegramRouter.patch(
       const invoiceNo = tgReceipt.purchase_no ? `TG-${tgReceipt.purchase_no}` : `TG-${String(id).split('-')[0]}`;
 
       const skippedMaterials: string[] = [];
+      let itemIndex = 0;
+
 
       for (const item of lineItems) {
         if (!item.item_name) continue;
@@ -459,8 +461,13 @@ telegramRouter.patch(
           continue;
         }
 
+        itemIndex++;
+        // Use /N suffix to match existing receipt grouping format (e.g. TG-7/1, TG-7/2)
+        // The frontend groups rows with the same base receipt number (before the /) as one receipt
+        const receiptNum = `${invoiceNo}/${itemIndex}`;
+
         newReceiptRows.push({
-          receipt_number: `${invoiceNo}-${item.sno || Math.floor(Math.random()*1000)}`,
+          receipt_number: receiptNum,
           customer_id:    tgReceipt.customer_id,
           material_id:    matchedMaterial.id,
           weight:         item.qty || 0,
