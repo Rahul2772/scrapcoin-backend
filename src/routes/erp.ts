@@ -1730,7 +1730,7 @@ erpRouter.get("/purchase-receipts", async (req, res) => {
       .from("erp_purchase_receipts")
       .select(`
         *,
-        erp_customers(name, phone),
+        erp_customers(name, phone, address),
         erp_materials(name, unit)
       `);
 
@@ -1758,6 +1758,7 @@ erpRouter.get("/purchase-receipts", async (req, res) => {
       created_at: pr.created_at,
       customer_name: pr.erp_customers?.name || "Walk-in Customer",
       customer_phone: pr.erp_customers?.phone || "",
+      customer_address: pr.erp_customers?.address || "",
       material_name: pr.erp_materials?.name || "",
       material_unit: pr.erp_materials?.unit || "kg",
     }));
@@ -1882,7 +1883,7 @@ erpRouter.post("/purchase-receipts", async (req, res) => {
       .from("erp_purchase_receipts")
       .select(`
         *,
-        erp_customers(name, phone),
+        erp_customers(name, phone, address),
         erp_materials(name, unit)
       `)
       .eq("id", firstReceipt.id)
@@ -1894,6 +1895,7 @@ erpRouter.post("/purchase-receipts", async (req, res) => {
       ...fullReceipt,
       customer_name: fullReceipt.erp_customers?.name || "Walk-in Customer",
       customer_phone: fullReceipt.erp_customers?.phone || "",
+      customer_address: fullReceipt.erp_customers?.address || "",
       material_name: fullReceipt.erp_materials?.name || "",
       material_unit: fullReceipt.erp_materials?.unit || "kg",
     };
@@ -2152,7 +2154,7 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
       .from("erp_purchase_receipts")
       .select(`
         *,
-        erp_customers(name, phone),
+        erp_customers(name, phone, address),
         erp_materials(name, unit)
       `)
       .like("receipt_number", `${baseReceiptNum}%`)
@@ -2174,6 +2176,7 @@ erpRouter.put("/purchase-receipts/:id", async (req, res) => {
       created_at: pr.created_at,
       customer_name: pr.erp_customers?.name || "Walk-in Customer",
       customer_phone: pr.erp_customers?.phone || "",
+      customer_address: pr.erp_customers?.address || "",
       material_name: pr.erp_materials?.name || "",
       material_unit: pr.erp_materials?.unit || "kg",
     }));

@@ -423,7 +423,7 @@ telegramRouter.get(
 
       let query = supabase
         .from("telegram_ingested_receipts")
-        .select("*, erp_customers(name, phone)")
+        .select("*, erp_customers(name, phone, address)")
         .order("created_at", { ascending: false });
 
       if (status) query = query.eq("status", status);
@@ -584,6 +584,13 @@ telegramRouter.patch(
 
         if (match) {
           customerId = match.id;
+          if (tgReceipt.customer_address) {
+            await supabase
+              .from("erp_customers")
+              .update({ address: tgReceipt.customer_address })
+              .eq("id", match.id)
+              .is("address", null);
+          }
         } else if (tgReceipt.customer_name) {
           // Auto-create customer
           const { data: newCust, error: custErr } = await supabase
