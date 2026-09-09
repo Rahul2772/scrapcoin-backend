@@ -55,6 +55,34 @@ const WEBHOOK_SECRET   = process.env.TELEGRAM_WEBHOOK_SECRET ?? ""; // may be em
 const TELEGRAM_API     = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const STORAGE_BUCKET   = "invoices"; // reuse existing bucket
 
+/** Ensure the invoices storage bucket exists in Supabase */
+async function ensureStorageBucket(): Promise<boolean> {
+  try {
+    const { data: buckets, error } = await supabase.storage.listBuckets();
+    if (error) {
+      console.warn("[Telegram] Error listing storage buckets:", error.message);
+      return false;
+    }
+    const exists = (buckets ?? []).some((b) => b.name === STORAGE_BUCKET);
+    if (!exists) {
+      const { error: createErr } = await supabase.storage.createBucket(STORAGE_BUCKET, {
+        public: true,
+      });
+      if (createErr) {
+        console.warn(`[Telegram] Could not auto-create bucket "${STORAGE_BUCKET}":`, createErr.message);
+        return false;
+      }
+      console.log(`[Telegram] Created storage bucket "${STORAGE_BUCKET}" successfully.`);
+    }
+    return true;
+  } catch (err: any) {
+    console.warn("[Telegram] ensureStorageBucket exception:", err.message);
+    return false;
+  }
+}
+// Run once on load
+ensureStorageBucket().catch(() => {});
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Send a Telegram message back to the trusted sender */
@@ -337,6 +365,7 @@ telegramRouter.post("/webhook", async (req: Request, res: Response): Promise<voi
     }
 
     // Phase 8 — Upload PDF to Supabase Storage
+    await ensureStorageBucket();
     const storagePath = `telegram/${receiptRow.id}.pdf`;
     const { error: storageErr } = await supabase.storage
       .from(STORAGE_BUCKET)
@@ -773,22 +802,48 @@ telegramRouter.get(
   requireAdminOrChampion,
   async (req: Request, res: Response): Promise<void> => {
     try {
+      const { id } = req.params;
       const { data: receipt, error } = await supabase
         .from("telegram_ingested_receipts")
-        .select("pdf_storage_path")
-        .eq("id", req.params.id)
+        .select("id, pdf_storage_path")
+        .eq("id", id)
         .single();
 
-      if (error || !receipt?.pdf_storage_path) {
-        res.status(404).json({ success: false, message: "PDF not found." });
+      if (error || !receipt) {
+        res.status(404).json({ success: false, message: "Receipt not found." });
+        return;
+      }
+
+      await ensureStorageBucket();
+
+      let targetPath = receipt.pdf_storage_path;
+
+      // If pdf_storage_path was null, check if a file was uploaded at the default path
+      if (!targetPath) {
+        const candidate = `telegram/${id}.pdf`;
+        const { data: files } = await supabase.storage
+          .from(STORAGE_BUCKET)
+          .list("telegram", { search: `${id}.pdf` });
+        if (files && files.length > 0) {
+          targetPath = candidate;
+          await supabase
+            .from("telegram_ingested_receipts")
+            .update({ pdf_storage_path: candidate })
+            .eq("id", id);
+        }
+      }
+
+      if (!targetPath) {
+        res.status(404).json({ success: false, message: "PDF not found in storage." });
         return;
       }
 
       const { data: signedData, error: signErr } = await supabase.storage
         .from(STORAGE_BUCKET)
-        .createSignedUrl(receipt.pdf_storage_path, 60 * 60); // 1-hour expiry
+        .createSignedUrl(targetPath, 60 * 60); // 1-hour expiry
 
       if (signErr || !signedData?.signedUrl) {
+        console.error("[Telegram PDF] createSignedUrl error:", signErr);
         res.status(500).json({ success: false, message: "Could not generate PDF URL." });
         return;
       }

@@ -420,3 +420,9 @@ END $$;
 ALTER TABLE telegram_ingested_receipts
   ADD COLUMN IF NOT EXISTS purchase_receipt_id UUID
   REFERENCES erp_purchase_receipts(id) ON DELETE SET NULL;
+
+-- Storage Bucket for Receipts / Invoices
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('invoices', 'invoices', true)
+ON CONFLICT (id) DO NOTHING;
+
