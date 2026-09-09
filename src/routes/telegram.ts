@@ -1,12 +1,15 @@
 /**
  * Telegram Receipt Ingestion Route
- * POST /api/telegram/webhook        — receives Telegram updates (PDF receipts)
- * GET  /api/telegram/receipts       — list ingested receipts (admin)
- * PATCH /api/telegram/receipts/:id/verify  — admin approves
+ * POST  /api/telegram/webhook              — receives Telegram updates (PDF receipts)
+ * GET   /api/telegram/receipts             — list ingested receipts (admin)
+ * PATCH /api/telegram/receipts/:id         — save edits to parsed fields before approving
+ * PATCH /api/telegram/receipts/:id/verify  — approve → creates real erp_purchase_receipts
  * PATCH /api/telegram/receipts/:id/reject  — admin rejects
+ * GET   /api/telegram/receipts/:id/pdf     — signed URL to original PDF
  */
 
 import { Router, type Request, type Response } from "express";
+import { z } from "zod";
 import { supabase } from "../lib/supabase.js";
 import { requireAdminOrChampion } from "../middleware/requireAdminOrChampion.js";
 // pdf-parse is a CJS module — import via createRequire for ESM compatibility
@@ -406,7 +409,99 @@ telegramRouter.get(
   }
 );
 
+// ── Zod schema for editing a Telegram receipt ────────────────────────────────
+const tgEditSchema = z.object({
+  customer_name:    z.string().trim().optional(),
+  customer_mobile:  z.string().trim().optional(),
+  customer_address: z.string().trim().optional().nullable(),
+  purchase_date:    z.string().trim().optional().nullable(),
+  payment_mode:     z.string().trim().optional().nullable(),
+  notes:            z.string().trim().optional().nullable(),
+  line_items: z.array(z.object({
+    item_name: z.string().trim().min(1, "Item name required"),
+    qty:       z.number().positive("Qty must be > 0"),
+    unit:      z.string().trim().optional().default("KG"),
+    rate:      z.number().nonnegative("Rate must be >= 0"),
+    amount:    z.number().optional(), // will be recalculated server-side
+  })).min(1, "At least one line item is required").optional(),
+});
+
+// ── PATCH /api/telegram/receipts/:id — Save edits before approving ───────────
+telegramRouter.patch(
+  "/receipts/:id",
+  requireAdminOrChampion,
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { id } = req.params;
+
+      // 1. Only allow editing pending_review receipts
+      const { data: existing, error: fetchErr } = await supabase
+        .from("telegram_ingested_receipts")
+        .select("status")
+        .eq("id", id)
+        .single();
+
+      if (fetchErr || !existing) {
+        res.status(404).json({ success: false, message: "Receipt not found." });
+        return;
+      }
+      if (existing.status !== "pending_review") {
+        res.status(409).json({ success: false, message: `Cannot edit a receipt that is already ${existing.status}.` });
+        return;
+      }
+
+      // 2. Validate body
+      const parsed = tgEditSchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(422).json({ success: false, errors: parsed.error.flatten() });
+        return;
+      }
+
+      const updates: Record<string, any> = {};
+      const d = parsed.data;
+
+      if (d.customer_name !== undefined)    updates.customer_name    = d.customer_name;
+      if (d.customer_mobile !== undefined)  updates.customer_mobile  = d.customer_mobile;
+      if (d.customer_address !== undefined) updates.customer_address = d.customer_address;
+      if (d.purchase_date !== undefined)    updates.purchase_date    = d.purchase_date;
+      if (d.payment_mode !== undefined)     updates.payment_mode     = d.payment_mode;
+      if (d.notes !== undefined)            updates.notes            = d.notes;
+
+      // 3. If line_items provided, recalculate totals server-side
+      if (d.line_items) {
+        const recalculated = d.line_items.map((item, idx) => ({
+          ...item,
+          sno: idx + 1,
+          amount: Number((item.qty * item.rate).toFixed(2)),
+        }));
+        const subtotal = recalculated.reduce((s, i) => s + i.amount, 0);
+        updates.line_items      = recalculated;
+        updates.subtotal_amount = subtotal;
+        updates.total_amount    = subtotal;
+      }
+
+      if (Object.keys(updates).length === 0) {
+        res.json({ success: true, message: "No changes to save." });
+        return;
+      }
+
+      // 4. Apply update
+      const { error: updateErr } = await supabase
+        .from("telegram_ingested_receipts")
+        .update(updates)
+        .eq("id", id);
+
+      if (updateErr) throw updateErr;
+
+      res.json({ success: true, message: "Receipt updated." });
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  }
+);
+
 // ── PATCH /api/telegram/receipts/:id/verify ──────────────────────────────────
+// Approves a Telegram receipt → creates real erp_purchase_receipts rows
 telegramRouter.patch(
   "/receipts/:id/verify",
   requireAdminOrChampion,
@@ -415,106 +510,228 @@ telegramRouter.patch(
       const { id } = req.params;
       const adminId = req.privilegedUser?.id;
 
-      // 1. Fetch the telegram receipt
+      // 1. Fetch the telegram receipt (reads whatever edits were saved)
       const { data: tgReceipt, error: fetchErr } = await supabase
         .from("telegram_ingested_receipts")
         .select("*")
         .eq("id", id)
         .single();
 
-      if (fetchErr || !tgReceipt) throw new Error("Receipt not found.");
-      if (tgReceipt.status === "verified") return; // already verified
-      
-      const lineItems = tgReceipt.line_items || [];
-      if (!Array.isArray(lineItems) || lineItems.length === 0) {
-        throw new Error("Cannot verify an unreadable receipt with no items. Please manually create a scale ticket.");
+      if (fetchErr || !tgReceipt) {
+        res.status(404).json({ success: false, message: "Receipt not found." });
+        return;
       }
 
-      // 2. Map line items to material IDs
+      // 2. Double-approval guard
+      if (tgReceipt.purchase_receipt_id) {
+        res.status(409).json({ success: false, message: "This receipt has already been approved and linked to a real receipt. Cannot approve again." });
+        return;
+      }
+      if (tgReceipt.status === "verified") {
+        res.status(409).json({ success: false, message: "This receipt is already verified." });
+        return;
+      }
+
+      const lineItems = tgReceipt.line_items || [];
+      if (!Array.isArray(lineItems) || lineItems.length === 0) {
+        res.status(400).json({ success: false, message: "Cannot verify a receipt with no items. Please edit and add items first." });
+        return;
+      }
+
+      // 3. Resolve customer: use existing customer_id, or auto-create from parsed fields
+      let customerId = tgReceipt.customer_id;
+      if (!customerId && tgReceipt.customer_mobile) {
+        const normalizedPhone = normalizePhone(tgReceipt.customer_mobile);
+
+        // Check for existing customer by phone
+        const { data: allCustomers } = await supabase
+          .from("erp_customers")
+          .select("id, phone")
+          .eq("is_active", true);
+
+        const match = (allCustomers ?? []).find(
+          (c) => c.phone && normalizePhone(c.phone) === normalizedPhone
+        );
+
+        if (match) {
+          customerId = match.id;
+        } else if (tgReceipt.customer_name) {
+          // Auto-create customer
+          const { data: newCust, error: custErr } = await supabase
+            .from("erp_customers")
+            .insert({
+              name:        tgReceipt.customer_name,
+              phone:       tgReceipt.customer_mobile,
+              address:     tgReceipt.customer_address ?? null,
+              created_via: "telegram_auto",
+              is_active:   true,
+            })
+            .select("id")
+            .single();
+
+          if (!custErr && newCust) {
+            customerId = newCust.id;
+          }
+        }
+      }
+
+      // 4. Map line items to material IDs via fuzzy match
       const { data: allMaterials, error: matErr } = await supabase
         .from("erp_materials")
-        .select("id, name");
-      
+        .select("id, name, unit, stock_qty");
+
       if (matErr || !allMaterials) throw new Error("Failed to fetch materials catalog.");
 
-      const newReceiptRows = [];
+      const newReceiptRows: any[] = [];
       const invoiceNo = tgReceipt.purchase_no ? `TG-${tgReceipt.purchase_no}` : `TG-${String(id).split('-')[0]}`;
-
       const skippedMaterials: string[] = [];
       let itemIndex = 0;
-
 
       for (const item of lineItems) {
         if (!item.item_name) continue;
         const normalizedName = item.item_name.trim().toLowerCase();
-        
-        // Try exact match first, then partial/contains match
+
+        // Exact match first, then partial/contains
         let matchedMaterial = allMaterials.find(m => m.name.toLowerCase() === normalizedName);
         if (!matchedMaterial) {
-          // Try: does the ERP material name appear inside the PDF item name? e.g. "NEWSPAPERS" vs "Books/Notebooks/Papers"
-          matchedMaterial = allMaterials.find(m => normalizedName.includes(m.name.toLowerCase()) || m.name.toLowerCase().includes(normalizedName));
+          matchedMaterial = allMaterials.find(m =>
+            normalizedName.includes(m.name.toLowerCase()) ||
+            m.name.toLowerCase().includes(normalizedName)
+          );
         }
-        
+
+        // If not found in materials catalog, auto-create material with the free-text name
         if (!matchedMaterial) {
-          // Skip this item with a warning instead of blocking the entire operation
-          skippedMaterials.push(item.item_name);
-          continue;
+          const cleanName = item.item_name.trim().slice(0, 100);
+          const { data: newMat, error: newMatErr } = await supabase
+            .from("erp_materials")
+            .insert({
+              name: cleanName,
+              category: "Miscellaneous",
+              unit: item.unit || "kg",
+              buy_price: item.rate || 0,
+              sell_price: item.rate || 0,
+              stock_qty: 0,
+              is_active: true,
+            })
+            .select("id, name, unit, stock_qty")
+            .single();
+
+          if (!newMatErr && newMat) {
+            matchedMaterial = newMat;
+            allMaterials.push(newMat);
+          } else {
+            // Fallback: match any misc material or first material, or leave material_id null
+            matchedMaterial = allMaterials.find(m => m.name.toLowerCase().includes("misc")) || allMaterials[0];
+          }
         }
 
         itemIndex++;
-        // Use /N suffix to match existing receipt grouping format (e.g. TG-7/1, TG-7/2)
-        // The frontend groups rows with the same base receipt number (before the /) as one receipt
         const receiptNum = `${invoiceNo}/${itemIndex}`;
+        const totalAmt = item.amount || Number((item.qty * item.rate).toFixed(2));
 
         newReceiptRows.push({
           receipt_number: receiptNum,
-          customer_id:    tgReceipt.customer_id,
-          material_id:    matchedMaterial.id,
+          customer_id:    customerId,
+          material_id:    matchedMaterial?.id || null,
           weight:         item.qty || 0,
-          unit:           "kg",
+          unit:           matchedMaterial?.unit || item.unit || "kg",
           price_per_unit: item.rate || 0,
-          total_amount:   item.amount || 0,
+          total_amount:   totalAmt,
           payment_method: tgReceipt.payment_mode || "cash",
-          notes:          "Auto-generated from Telegram receipt",
+          notes:          tgReceipt.notes ? `${item.item_name} — ${tgReceipt.notes}` : item.item_name,
           created_by:     adminId,
-          created_at:     tgReceipt.purchase_date ? new Date(tgReceipt.purchase_date).toISOString() : new Date().toISOString()
+          created_at:     tgReceipt.purchase_date ? new Date(tgReceipt.purchase_date).toISOString() : new Date().toISOString(),
         });
       }
 
       if (newReceiptRows.length === 0 && lineItems.length > 0) {
-        throw new Error(`No materials matched: [${lineItems.map((i: any) => i.item_name).join(', ')}]. Please add them to the ERP Materials catalog first.`);
+        res.status(400).json({
+          success: false,
+          message: `Could not process items: [${lineItems.map((i: any) => i.item_name).join(', ')}].`,
+        });
+        return;
       }
 
-      // 3. Insert into erp_purchase_receipts
+      // 5. Insert into erp_purchase_receipts
+      let firstReceiptId: string | null = null;
       if (newReceiptRows.length > 0) {
-        const { error: insertErr } = await supabase
+        const { data: insertedRows, error: insertErr } = await supabase
           .from("erp_purchase_receipts")
-          .insert(newReceiptRows);
-        
+          .insert(newReceiptRows)
+          .select("id");
+
         if (insertErr) {
           if (insertErr.code === '23505') {
-             // Unique violation on receipt_number, which might happen if already verified manually
-             throw new Error("These receipt numbers already exist. It might have been verified already.");
+            res.status(409).json({ success: false, message: "These receipt numbers already exist. The receipt may have been verified already." });
+            return;
           }
           throw new Error("Failed to create ERP receipt: " + insertErr.message);
         }
+
+        firstReceiptId = insertedRows?.[0]?.id ?? null;
+
+        // 6. Update material stock + avg cost for each matched material
+        for (const row of newReceiptRows) {
+          const mat = allMaterials.find(m => m.id === row.material_id);
+          if (mat) {
+            await supabase
+              .from("erp_materials")
+              .update({
+                stock_qty: Number(mat.stock_qty || 0) + row.weight,
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", row.material_id);
+          }
+        }
+
+        // 7. Update customer stats if customer resolved
+        if (customerId) {
+          const cumulativeTotal = newReceiptRows.reduce((s, r) => s + r.total_amount, 0);
+          const receiptDate = tgReceipt.purchase_date || new Date().toISOString();
+          const { data: customer } = await supabase
+            .from("erp_customers")
+            .select("total_visits, total_paid")
+            .eq("id", customerId)
+            .single();
+
+          if (customer) {
+            await supabase
+              .from("erp_customers")
+              .update({
+                total_visits: (customer.total_visits || 0) + 1,
+                total_paid: Number(customer.total_paid || 0) + cumulativeTotal,
+                last_receipt_date: receiptDate,
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", customerId);
+          }
+        }
       }
 
-      // 4. Mark as verified
+      // 8. Mark as verified + link to real receipt
       const { error } = await supabase
         .from("telegram_ingested_receipts")
         .update({
-          status:      "verified",
-          verified_by: adminId,
-          verified_at: new Date().toISOString(),
+          status:              "verified",
+          verified_by:         adminId,
+          verified_at:         new Date().toISOString(),
+          customer_id:         customerId,
+          purchase_receipt_id: firstReceiptId,
         })
         .eq("id", id);
 
       if (error) throw error;
+
       const skipNote = skippedMaterials.length > 0
         ? ` (${skippedMaterials.length} item(s) skipped — not found in catalog: ${skippedMaterials.join(', ')})`
         : '';
-      res.json({ success: true, message: `Receipt verified and ${newReceiptRows.length} item(s) added to main ERP.${skipNote}` });
+
+      res.json({
+        success: true,
+        message: `Receipt approved — ${newReceiptRows.length} item(s) added to ERP as ${invoiceNo}.${skipNote}`,
+        receipt_number: invoiceNo,
+      });
     } catch (err: any) {
       res.status(500).json({ success: false, message: err.message });
     }

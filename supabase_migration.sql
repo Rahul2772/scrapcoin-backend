@@ -414,3 +414,9 @@ DO $$ BEGIN
       ON telegram_ingested_receipts FOR SELECT TO authenticated USING (true);
   END IF;
 END $$;
+
+-- Link verified Telegram receipts to the real ERP receipt they produced
+-- Prevents double-approval: if purchase_receipt_id IS NOT NULL, the receipt was already approved
+ALTER TABLE telegram_ingested_receipts
+  ADD COLUMN IF NOT EXISTS purchase_receipt_id UUID
+  REFERENCES erp_purchase_receipts(id) ON DELETE SET NULL;
