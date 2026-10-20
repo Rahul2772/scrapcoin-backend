@@ -426,3 +426,110 @@ INSERT INTO storage.buckets (id, name, public)
 VALUES ('invoices', 'invoices', true)
 ON CONFLICT (id) DO NOTHING;
 
+-- =============================================================================
+-- Migration: Operational Expenses (Phase 1 – Phase 3 schema, built all at once)
+-- =============================================================================
+
+-- 1. Expense categories
+CREATE TABLE IF NOT EXISTS erp_expense_categories (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name       VARCHAR(50) UNIQUE NOT NULL,
+  is_active  BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+INSERT INTO erp_expense_categories (name) VALUES
+  ('Marketing'), ('Travel'), ('Transport'), ('Print'), ('Rent'), ('Subscription')
+ON CONFLICT (name) DO NOTHING;
+
+-- 2. Sequence for expense numbers (EXP-1001, EXP-1002, …)
+CREATE SEQUENCE IF NOT EXISTS expense_number_seq START 1001;
+
+-- 2a. RPC wrapper so the backend can call supabase.rpc('nextval_expense_number')
+CREATE OR REPLACE FUNCTION nextval_expense_number()
+RETURNS BIGINT AS $$
+  SELECT nextval('expense_number_seq');
+$$ LANGUAGE SQL;
+
+-- 3. Expenses table
+CREATE TABLE IF NOT EXISTS erp_expenses (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  expense_number  VARCHAR(20) UNIQUE NOT NULL,
+  category_id     UUID REFERENCES erp_expense_categories(id) ON DELETE SET NULL,
+  amount          NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+  expense_date    DATE NOT NULL,
+  description     TEXT,
+  vendor          VARCHAR(150),
+  payment_method  VARCHAR(30) DEFAULT 'cash',
+  receipt_url     TEXT,
+  is_recurring    BOOLEAN DEFAULT FALSE,
+
+  -- Who paid
+  paid_by         VARCHAR(20) NOT NULL DEFAULT 'company'
+                  CHECK (paid_by IN ('company', 'champion')),
+  champion_id     UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+
+  -- Approval (Phase 1 admin entries default to 'approved')
+  approval_status VARCHAR(20) NOT NULL DEFAULT 'approved'
+                  CHECK (approval_status IN ('pending', 'approved', 'rejected')),
+  approved_by     UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+  approved_at     TIMESTAMPTZ,
+  rejection_reason TEXT,
+
+  -- Reimbursement (only meaningful when paid_by = 'champion')
+  reimbursement_status VARCHAR(20) NOT NULL DEFAULT 'not_applicable'
+                       CHECK (reimbursement_status IN ('not_applicable', 'pending', 'reimbursed')),
+  reimbursed_at        TIMESTAMPTZ,
+  reimbursed_by        UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+  reimbursement_method VARCHAR(30),
+  reimbursement_ref    VARCHAR(100),
+
+  -- Soft delete (financial data must not be hard-deleted)
+  is_void    BOOLEAN DEFAULT FALSE,
+  voided_at  TIMESTAMPTZ,
+  voided_by  UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+
+  -- Optional GST fields (cheap to add now, painful to backfill)
+  gst_amount   NUMERIC(12,2) DEFAULT 0,
+  vendor_gstin VARCHAR(20),
+
+  created_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+
+  -- Integrity constraints
+  CONSTRAINT chk_champion_required
+    CHECK (paid_by = 'company' OR champion_id IS NOT NULL),
+  CONSTRAINT chk_reimbursed_has_date
+    CHECK (reimbursement_status <> 'reimbursed' OR reimbursed_at IS NOT NULL)
+);
+
+-- 4. Indexes
+CREATE INDEX IF NOT EXISTS idx_erp_expenses_date
+  ON erp_expenses(expense_date DESC);
+CREATE INDEX IF NOT EXISTS idx_erp_expenses_category
+  ON erp_expenses(category_id);
+CREATE INDEX IF NOT EXISTS idx_erp_expenses_champion
+  ON erp_expenses(champion_id, reimbursement_status);
+CREATE INDEX IF NOT EXISTS idx_erp_expenses_status
+  ON erp_expenses(approval_status);
+
+-- 5. Auto-update updated_at on every row change
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS update_erp_expenses_updated_at ON erp_expenses;
+CREATE TRIGGER update_erp_expenses_updated_at
+  BEFORE UPDATE ON erp_expenses
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- 6. Storage bucket for expense receipts (private – serve via signed URLs)
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('expense-receipts', 'expense-receipts', false)
+ON CONFLICT (id) DO NOTHING;
+

@@ -2666,3 +2666,383 @@ erpRouter.get("/dashboard", async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
+// =============================================================================
+// ── OPERATIONAL EXPENSES (Phase 1) ───────────────────────────────────────────
+// =============================================================================
+
+const expenseSchema = z.object({
+  category_id:    z.string().uuid(),
+  amount:         z.number().positive({ message: "Amount must be greater than 0" }),
+  expense_date:   z.string().refine(
+    (d) => !isNaN(Date.parse(d)) && new Date(d) <= new Date(),
+    { message: "Expense date is invalid or in the future" }
+  ),
+  description:    z.string().trim().optional().nullable(),
+  vendor:         z.string().trim().max(150).optional().nullable(),
+  payment_method: z.enum(["cash", "upi", "card", "bank"]).default("cash"),
+  is_recurring:   z.boolean().default(false),
+  gst_amount:     z.number().nonnegative().default(0),
+  vendor_gstin:   z.string().trim().max(20).optional().nullable(),
+  receipt_url:    z.string().optional().nullable(),
+});
+
+// ── GET /api/erp/expenses/categories ─────────────────────────────────────────
+erpRouter.get("/expenses/categories", async (_req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("erp_expense_categories")
+      .select("id, name")
+      .eq("is_active", true)
+      .order("name");
+    if (error) throw error;
+    res.json({ success: true, categories: data });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── GET /api/erp/expenses/summary ─────────────────────────────────────────────
+// Returns totals by category and monthly trend (last 12 months).
+// Always filters approved & non-voided expenses only.
+erpRouter.get("/expenses/summary", async (req, res) => {
+  try {
+    const { from, to } = req.query as Record<string, string>;
+
+    const now   = new Date();
+    const start = from || new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split("T")[0];
+    const end   = to   || now.toISOString().split("T")[0];
+
+    const { data: expenses, error } = await supabase
+      .from("erp_expenses")
+      .select("amount, expense_date, erp_expense_categories(name)")
+      .eq("approval_status", "approved")
+      .eq("is_void", false)
+      .gte("expense_date", start)
+      .lte("expense_date", end);
+    if (error) throw error;
+
+    // Aggregate by category
+    const categoryMap: Record<string, { total: number; count: number }> = {};
+    for (const e of expenses || []) {
+      const cat = (e.erp_expense_categories as any)?.name || "Uncategorised";
+      if (!categoryMap[cat]) categoryMap[cat] = { total: 0, count: 0 };
+      categoryMap[cat].total += Number(e.amount);
+      categoryMap[cat].count += 1;
+    }
+    const byCategory = Object.entries(categoryMap)
+      .map(([name, v]) => ({ name, total: Number(v.total.toFixed(2)), count: v.count }))
+      .sort((a, b) => b.total - a.total);
+
+    // Monthly trend (last 12 months)
+    const twelveMonthsAgo = new Date();
+    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 11);
+    twelveMonthsAgo.setDate(1);
+    const { data: trendData, error: trendErr } = await supabase
+      .from("erp_expenses")
+      .select("amount, expense_date")
+      .eq("approval_status", "approved")
+      .eq("is_void", false)
+      .gte("expense_date", twelveMonthsAgo.toISOString().split("T")[0]);
+    if (trendErr) throw trendErr;
+
+    const monthMap: Record<string, number> = {};
+    for (const e of trendData || []) {
+      const month = e.expense_date.substring(0, 7);
+      monthMap[month] = (monthMap[month] || 0) + Number(e.amount);
+    }
+    const monthly_trend = Object.entries(monthMap)
+      .map(([month, total]) => ({ month, total: Number(total.toFixed(2)) }))
+      .sort((a, b) => a.month.localeCompare(b.month));
+
+    // This month / last month card figures
+    const thisMonthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
+    const lastMonthDate  = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const lastMonthStart = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, "0")}-01`;
+    const lastMonthEnd   = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().split("T")[0];
+
+    const thisMonthTotal = (trendData || [])
+      .filter((e) => e.expense_date >= thisMonthStart)
+      .reduce((s, e) => s + Number(e.amount), 0);
+    const lastMonthTotal = (trendData || [])
+      .filter((e) => e.expense_date >= lastMonthStart && e.expense_date <= lastMonthEnd)
+      .reduce((s, e) => s + Number(e.amount), 0);
+
+    const pctChange = lastMonthTotal > 0
+      ? Number((((thisMonthTotal - lastMonthTotal) / lastMonthTotal) * 100).toFixed(1))
+      : null;
+
+    res.json({
+      success: true,
+      summary: {
+        this_month_total: Number(thisMonthTotal.toFixed(2)),
+        last_month_total: Number(lastMonthTotal.toFixed(2)),
+        pct_change:       pctChange,
+        top_category:     byCategory[0]?.name || null,
+        by_category:      byCategory,
+        monthly_trend,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── GET /api/erp/expenses ─────────────────────────────────────────────────────
+erpRouter.get("/expenses", async (req, res) => {
+  try {
+    const {
+      from, to, category_id, approval_status, search,
+      page = "1", limit = "30",
+    } = req.query as Record<string, string>;
+
+    const pageNum   = Math.max(1, parseInt(page));
+    const limitNum  = Math.min(100, Math.max(1, parseInt(limit)));
+    const offset    = (pageNum - 1) * limitNum;
+
+    let query = supabase
+      .from("erp_expenses")
+      .select(`
+        id, expense_number, amount, expense_date, description, vendor,
+        payment_method, receipt_url, is_recurring, paid_by, approval_status,
+        reimbursement_status, is_void, gst_amount, vendor_gstin,
+        created_at, updated_at,
+        erp_expense_categories(id, name)
+      `, { count: "exact" })
+      .eq("is_void", false)
+      .order("expense_date", { ascending: false })
+      .range(offset, offset + limitNum - 1);
+
+    if (from)            query = query.gte("expense_date", from);
+    if (to)              query = query.lte("expense_date", to);
+    if (category_id)     query = query.eq("category_id", category_id);
+    if (approval_status) query = query.eq("approval_status", approval_status);
+    if (search)          query = query.or(`description.ilike.%${search}%,vendor.ilike.%${search}%`);
+
+    const { data, error, count } = await query;
+    if (error) throw error;
+    res.json({ success: true, count, page: pageNum, expenses: data });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── GET /api/erp/expenses/:id ─────────────────────────────────────────────────
+erpRouter.get("/expenses/:id", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("erp_expenses")
+      .select("*, erp_expense_categories(id, name)")
+      .eq("id", req.params.id)
+      .single();
+    if (error || !data) {
+      res.status(404).json({ success: false, message: "Expense not found" });
+      return;
+    }
+    res.json({ success: true, expense: data });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── POST /api/erp/expenses ────────────────────────────────────────────────────
+erpRouter.post("/expenses", async (req, res) => {
+  if (req.privilegedUser?.role !== "admin") {
+    res.status(403).json({ error: "Admin access required" });
+    return;
+  }
+  try {
+    const parsed = expenseSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ success: false, message: parsed.error.errors[0].message });
+      return;
+    }
+    const body = parsed.data;
+
+    // Verify category exists and is active
+    const { data: cat } = await supabase
+      .from("erp_expense_categories")
+      .select("id")
+      .eq("id", body.category_id)
+      .eq("is_active", true)
+      .single();
+    if (!cat) {
+      res.status(400).json({ success: false, message: "Invalid or inactive category" });
+      return;
+    }
+
+    // Generate sequential expense number using PostgreSQL sequence
+    const { data: seqRow, error: seqErr } = await supabase
+      .rpc("nextval_expense_number") as { data: number; error: any };
+    const seqNum = seqErr ? Date.now() : seqRow;
+    const expense_number = `EXP-${seqNum}`;
+
+    const { data: expense, error } = await supabase
+      .from("erp_expenses")
+      .insert({
+        expense_number,
+        category_id:          body.category_id,
+        amount:               body.amount,
+        expense_date:         body.expense_date,
+        description:          body.description ?? null,
+        vendor:               body.vendor ?? null,
+        payment_method:       body.payment_method,
+        is_recurring:         body.is_recurring,
+        gst_amount:           body.gst_amount,
+        vendor_gstin:         body.vendor_gstin ?? null,
+        receipt_url:          body.receipt_url ?? null,
+        paid_by:              "company",
+        approval_status:      "approved",
+        reimbursement_status: "not_applicable",
+        created_by:           req.privilegedUser.id,
+      })
+      .select("*, erp_expense_categories(id, name)")
+      .single();
+
+    if (error) throw error;
+    res.status(201).json({ success: true, expense });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── PUT /api/erp/expenses/:id ─────────────────────────────────────────────────
+erpRouter.put("/expenses/:id", async (req, res) => {
+  if (req.privilegedUser?.role !== "admin") {
+    res.status(403).json({ error: "Admin access required" });
+    return;
+  }
+  try {
+    const parsed = expenseSchema.partial().safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ success: false, message: parsed.error.errors[0].message });
+      return;
+    }
+
+    const { data: existing } = await supabase
+      .from("erp_expenses")
+      .select("is_void")
+      .eq("id", req.params.id)
+      .single();
+    if (!existing) {
+      res.status(404).json({ success: false, message: "Expense not found" });
+      return;
+    }
+    if (existing.is_void) {
+      res.status(400).json({ success: false, message: "Cannot edit a voided expense" });
+      return;
+    }
+
+    const { data: expense, error } = await supabase
+      .from("erp_expenses")
+      .update({ ...parsed.data, updated_at: new Date().toISOString() })
+      .eq("id", req.params.id)
+      .select("*, erp_expense_categories(id, name)")
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, expense });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── DELETE /api/erp/expenses/:id  (soft void — no hard deletes) ───────────────
+erpRouter.delete("/expenses/:id", async (req, res) => {
+  if (req.privilegedUser?.role !== "admin") {
+    res.status(403).json({ error: "Admin access required" });
+    return;
+  }
+  try {
+    const { data: existing } = await supabase
+      .from("erp_expenses")
+      .select("is_void")
+      .eq("id", req.params.id)
+      .single();
+    if (!existing) {
+      res.status(404).json({ success: false, message: "Expense not found" });
+      return;
+    }
+    if (existing.is_void) {
+      res.status(400).json({ success: false, message: "Expense is already voided" });
+      return;
+    }
+
+    const { error } = await supabase
+      .from("erp_expenses")
+      .update({
+        is_void:   true,
+        voided_at: new Date().toISOString(),
+        voided_by: req.privilegedUser.id,
+      })
+      .eq("id", req.params.id);
+
+    if (error) throw error;
+    res.json({ success: true, message: "Expense voided successfully" });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── POST /api/erp/expenses/upload-receipt ────────────────────────────────────
+// Accepts a base64-encoded file. Returns the storage path + a 1-hour signed URL.
+erpRouter.post("/expenses/upload-receipt", async (req, res) => {
+  if (req.privilegedUser?.role !== "admin") {
+    res.status(403).json({ error: "Admin access required" });
+    return;
+  }
+  try {
+    const { base64, mime_type } = req.body as { base64: string; mime_type: string };
+    const ALLOWED = ["image/jpeg", "image/png", "application/pdf"];
+    if (!ALLOWED.includes(mime_type)) {
+      res.status(400).json({ success: false, message: "Only JPEG, PNG and PDF files are allowed" });
+      return;
+    }
+    const buffer = Buffer.from(base64, "base64");
+    if (buffer.byteLength > 5 * 1024 * 1024) {
+      res.status(400).json({ success: false, message: "File must be smaller than 5 MB" });
+      return;
+    }
+
+    const ext  = mime_type === "application/pdf" ? "pdf" : mime_type === "image/png" ? "png" : "jpg";
+    const now  = new Date();
+    const yyyy = now.getFullYear();
+    const mm   = String(now.getMonth() + 1).padStart(2, "0");
+    const uid  = crypto.randomUUID();
+    const path = `${yyyy}/${mm}/${uid}.${ext}`;
+
+    const { error: uploadErr } = await supabase.storage
+      .from("expense-receipts")
+      .upload(path, buffer, { contentType: mime_type, upsert: false });
+    if (uploadErr) throw uploadErr;
+
+    const { data: signed } = await supabase.storage
+      .from("expense-receipts")
+      .createSignedUrl(path, 3600);
+
+    res.json({ success: true, path, signed_url: signed?.signedUrl ?? null });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── GET /api/erp/expenses/:id/receipt-url ────────────────────────────────────
+erpRouter.get("/expenses/:id/receipt-url", async (req, res) => {
+  try {
+    const { data: expense } = await supabase
+      .from("erp_expenses")
+      .select("receipt_url")
+      .eq("id", req.params.id)
+      .single();
+    if (!expense?.receipt_url) {
+      res.status(404).json({ success: false, message: "No receipt for this expense" });
+      return;
+    }
+    const { data: signed } = await supabase.storage
+      .from("expense-receipts")
+      .createSignedUrl(expense.receipt_url, 3600);
+    res.json({ success: true, url: signed?.signedUrl ?? null });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
