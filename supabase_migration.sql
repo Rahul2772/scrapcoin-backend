@@ -533,3 +533,16 @@ INSERT INTO storage.buckets (id, name, public)
 VALUES ('expense-receipts', 'expense-receipts', false)
 ON CONFLICT (id) DO NOTHING;
 
+-- 7. Operational Expense Categories (Phase 2 Additions)
+INSERT INTO erp_expense_categories (name, is_active) VALUES
+  ('Marketing – Offline', true),
+  ('Marketing – Online', true),
+  ('Internet & Telecommunication', true),
+  ('Miscellaneous', true)
+ON CONFLICT (name) DO NOTHING;
+
+-- Deprecate legacy Marketing category for new additions
+UPDATE erp_expense_categories
+SET is_active = false
+WHERE name = 'Marketing';
+

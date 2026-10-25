@@ -3,6 +3,8 @@ import { z } from "zod";
 import { requireAdminOrChampion } from "../middleware/requireAdminOrChampion.js";
 import { supabase } from "../lib/supabase.js";
 import { sendWhatsAppMessage } from "../lib/twilio.js";
+import { getExpenseSummaryData } from "../lib/expense-summary.js";
+import { isLegacyCategoryName } from "../constants/expense-categories.js";
 
 export const erpRouter = Router();
 
@@ -2703,90 +2705,38 @@ erpRouter.get("/expenses/categories", async (_req, res) => {
 });
 
 // ── GET /api/erp/expenses/summary ─────────────────────────────────────────────
-// Returns totals by category and monthly trend (last 12 months).
-// Always filters approved & non-voided expenses only.
+// Returns unified totals by category, monthly trend (last 12 months), year-to-date
+// and pending count. Enforces admin-only access and Asia/Kolkata timezone.
 erpRouter.get("/expenses/summary", async (req, res) => {
+  if (req.privilegedUser?.role !== "admin") {
+    res.status(403).json({ success: false, message: "Admin access required" });
+    return;
+  }
   try {
     const { from, to } = req.query as Record<string, string>;
-
-    const now   = new Date();
-    const start = from || new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split("T")[0];
-    const end   = to   || now.toISOString().split("T")[0];
-
-    const { data: expenses, error } = await supabase
-      .from("erp_expenses")
-      .select("amount, expense_date, erp_expense_categories(name)")
-      .eq("approval_status", "approved")
-      .eq("is_void", false)
-      .gte("expense_date", start)
-      .lte("expense_date", end);
-    if (error) throw error;
-
-    // Aggregate by category
-    const categoryMap: Record<string, { total: number; count: number }> = {};
-    for (const e of expenses || []) {
-      const cat = (e.erp_expense_categories as any)?.name || "Uncategorised";
-      if (!categoryMap[cat]) categoryMap[cat] = { total: 0, count: 0 };
-      categoryMap[cat].total += Number(e.amount);
-      categoryMap[cat].count += 1;
-    }
-    const byCategory = Object.entries(categoryMap)
-      .map(([name, v]) => ({ name, total: Number(v.total.toFixed(2)), count: v.count }))
-      .sort((a, b) => b.total - a.total);
-
-    // Monthly trend (last 12 months)
-    const twelveMonthsAgo = new Date();
-    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 11);
-    twelveMonthsAgo.setDate(1);
-    const { data: trendData, error: trendErr } = await supabase
-      .from("erp_expenses")
-      .select("amount, expense_date")
-      .eq("approval_status", "approved")
-      .eq("is_void", false)
-      .gte("expense_date", twelveMonthsAgo.toISOString().split("T")[0]);
-    if (trendErr) throw trendErr;
-
-    const monthMap: Record<string, number> = {};
-    for (const e of trendData || []) {
-      const month = e.expense_date.substring(0, 7);
-      monthMap[month] = (monthMap[month] || 0) + Number(e.amount);
-    }
-    const monthly_trend = Object.entries(monthMap)
-      .map(([month, total]) => ({ month, total: Number(total.toFixed(2)) }))
-      .sort((a, b) => a.month.localeCompare(b.month));
-
-    // This month / last month card figures
-    const thisMonthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
-    const lastMonthDate  = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-    const lastMonthStart = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, "0")}-01`;
-    const lastMonthEnd   = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().split("T")[0];
-
-    const thisMonthTotal = (trendData || [])
-      .filter((e) => e.expense_date >= thisMonthStart)
-      .reduce((s, e) => s + Number(e.amount), 0);
-    const lastMonthTotal = (trendData || [])
-      .filter((e) => e.expense_date >= lastMonthStart && e.expense_date <= lastMonthEnd)
-      .reduce((s, e) => s + Number(e.amount), 0);
-
-    const pctChange = lastMonthTotal > 0
-      ? Number((((thisMonthTotal - lastMonthTotal) / lastMonthTotal) * 100).toFixed(1))
-      : null;
+    const summary = await getExpenseSummaryData({ from, to });
 
     res.json({
       success: true,
-      summary: {
-        this_month_total: Number(thisMonthTotal.toFixed(2)),
-        last_month_total: Number(lastMonthTotal.toFixed(2)),
-        pct_change:       pctChange,
-        top_category:     byCategory[0]?.name || null,
-        by_category:      byCategory,
-        monthly_trend,
-      },
+      period: summary.period,
+      total_approved: summary.total_approved,
+      this_month_total: summary.this_month_total,
+      previous_period_total: summary.previous_period_total,
+      last_month_total: summary.last_month_total,
+      change_pct: summary.change_pct,
+      pct_change: summary.pct_change,
+      year_to_date: summary.year_to_date,
+      pending_count: summary.pending_count,
+      top_category: summary.top_category,
+      by_category: summary.by_category,
+      monthly_trend: summary.monthly_trend,
+      summary,
     });
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
 
 // ── GET /api/erp/expenses ─────────────────────────────────────────────────────
 erpRouter.get("/expenses", async (req, res) => {
@@ -2859,15 +2809,15 @@ erpRouter.post("/expenses", async (req, res) => {
     }
     const body = parsed.data;
 
-    // Verify category exists and is active
+    // Verify category exists, is active, and is not legacy 'marketing'
     const { data: cat } = await supabase
       .from("erp_expense_categories")
-      .select("id")
+      .select("id, name, is_active")
       .eq("id", body.category_id)
       .eq("is_active", true)
       .single();
-    if (!cat) {
-      res.status(400).json({ success: false, message: "Invalid or inactive category" });
+    if (!cat || isLegacyCategoryName(cat.name)) {
+      res.status(400).json({ success: false, message: "Invalid, inactive, or legacy category" });
       return;
     }
 
@@ -2921,7 +2871,7 @@ erpRouter.put("/expenses/:id", async (req, res) => {
 
     const { data: existing } = await supabase
       .from("erp_expenses")
-      .select("is_void")
+      .select("is_void, category_id")
       .eq("id", req.params.id)
       .single();
     if (!existing) {
@@ -2931,6 +2881,20 @@ erpRouter.put("/expenses/:id", async (req, res) => {
     if (existing.is_void) {
       res.status(400).json({ success: false, message: "Cannot edit a voided expense" });
       return;
+    }
+
+    // If changing category, it must exist, be active, and not be legacy 'marketing'
+    if (parsed.data.category_id && parsed.data.category_id !== existing.category_id) {
+      const { data: cat } = await supabase
+        .from("erp_expense_categories")
+        .select("id, name, is_active")
+        .eq("id", parsed.data.category_id)
+        .eq("is_active", true)
+        .single();
+      if (!cat || isLegacyCategoryName(cat.name)) {
+        res.status(400).json({ success: false, message: "Invalid, inactive, or legacy category" });
+        return;
+      }
     }
 
     const { data: expense, error } = await supabase

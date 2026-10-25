@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { requireAdmin } from "../middleware/requireAdmin.js";
 import { supabase } from "../lib/supabase.js";
+import { getExpenseSummaryData } from "../lib/expense-summary.js";
 
 export const adminRouter = Router();
 
@@ -89,6 +90,28 @@ adminRouter.post("/invite", async (req, res) => {
   } catch (err) {
     return res.status(500).json({
       error: err instanceof Error ? err.message : "Failed to send invite",
+    });
+  }
+});
+
+// GET /api/admin/dashboard/expenses — main dashboard expense summary
+adminRouter.get("/dashboard/expenses", async (req, res) => {
+  try {
+    const { from, to } = req.query as Record<string, string>;
+    const summary = await getExpenseSummaryData({ from, to });
+    return res.json({
+      period: summary.period,
+      total_approved: summary.total_approved,
+      previous_period_total: summary.previous_period_total,
+      change_pct: summary.change_pct,
+      year_to_date: summary.year_to_date,
+      pending_count: summary.pending_count,
+      by_category: summary.by_category,
+      summary,
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "Failed to fetch dashboard expenses",
     });
   }
 });
