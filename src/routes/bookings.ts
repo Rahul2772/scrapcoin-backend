@@ -7,6 +7,7 @@ import { requireAdminOrChampion } from "../middleware/requireAdminOrChampion.js"
 import { supabase } from "../lib/supabase.js";
 import { verifySupabaseToken } from "../lib/jwt.js";
 import { sendWhatsAppMessage, sendSMSMessage } from "../lib/twilio.js";
+import { notifyNewBooking } from "../lib/telegram.js";
 import {
   getBookingById,
   getBookings,
@@ -208,6 +209,28 @@ bookingsRouter.post("/", bookingLimiter, async (req, res) => {
       "new_booking",
       booking.id
     );
+
+    // Telegram booking alert — fire non-blocking; never blocks the customer response
+    notifyNewBooking(
+      {
+        TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
+        TELEGRAM_NOTIFY_CHAT_ID: process.env.TELEGRAM_NOTIFY_CHAT_ID,
+      },
+      {
+        id: booking.id,
+        fullName: parsed.data.fullName,
+        phone: parsed.data.phone,
+        society: parsed.data.society,
+        tower: parsed.data.tower ?? null,
+        pickupDate: parsed.data.pickupDate,
+        materials: parsed.data.materials,
+        lat: parsed.data.lat ?? null,
+        lng: parsed.data.lng ?? null,
+        createdAt: booking.createdAt,
+      }
+    ).catch((err) => {
+      console.error("[Telegram] Unexpected error in notifyNewBooking:", err);
+    });
     // Dispatch notifications asynchronously to not block the API response
     const materialsStr = parsed.data.materials.join(", ");
     const addressStr = parsed.data.tower ? `${parsed.data.tower}, ${parsed.data.society}` : parsed.data.society;
@@ -330,6 +353,26 @@ bookingsRouter.post("/admin", requireAdminOrChampion, async (req, res) => {
       "new_booking",
       booking.id
     );
+
+    // Telegram booking alert — fire non-blocking
+    notifyNewBooking(
+      {
+        TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
+        TELEGRAM_NOTIFY_CHAT_ID: process.env.TELEGRAM_NOTIFY_CHAT_ID,
+      },
+      {
+        id: booking.id,
+        fullName: parsed.data.fullName,
+        phone: parsed.data.phone,
+        society: parsed.data.society,
+        tower: parsed.data.tower ?? null,
+        pickupDate: parsed.data.pickupDate,
+        materials: parsed.data.materials,
+        createdAt: booking.createdAt,
+      }
+    ).catch((err) => {
+      console.error("[Telegram] Unexpected error in notifyNewBooking (admin):", err);
+    });
 
     // Auto-upsert ERP customer if status is scheduled/completed
     if (parsed.data.status === "scheduled" || parsed.data.status === "completed") {
