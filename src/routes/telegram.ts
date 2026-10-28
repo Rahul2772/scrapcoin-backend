@@ -149,8 +149,8 @@ function parseReceiptText(text: string): Record<string, any> {
     if (nameLine && !/mobile|phone|address|₹/i.test(nameLine)) {
       result.customer_name = nameLine;
     }
-    // Look for a 10-digit mobile in the BILL TO section (within 5 lines)
-    for (let i = billFromIdx + 1; i <= Math.min(billFromIdx + 5, lines.length - 1); i++) {
+    // Look for a 10-digit mobile in the BILL TO section (within 8 lines)
+    for (let i = billFromIdx + 1; i <= Math.min(billFromIdx + 8, lines.length - 1); i++) {
       // Strip known label prefixes like "Mobile :" or "Phone:" before matching
       const cleanLine = lines[i].replace(/^(mobile|phone)\s*[:\-]?\s*/i, '');
       const mobileMatch = cleanLine.match(/(\d{10})/);
@@ -159,12 +159,49 @@ function parseReceiptText(text: string): Record<string, any> {
         break;
       }
     }
-  }
-  // NOTE: No global fallback scan — it would pick up The Scrap Co.'s own business number
 
-  // ── Address (optional) ────────────────────────────────────────────────────
-  const addrMatch = text.match(/Address\s*[:\-]?\s*(.+)/i);
-  if (addrMatch) result.customer_address = addrMatch[1].trim();
+    // ── Address: look within the BILL TO section (within 10 lines of section header)
+    // Collect address lines — may span multiple lines (e.g. tower, street, city)
+    const addrLabelIdx = (() => {
+      for (let i = billFromIdx + 1; i <= Math.min(billFromIdx + 10, lines.length - 1); i++) {
+        if (/^address\s*[:\-]?/i.test(lines[i])) return i;
+      }
+      return -1;
+    })();
+
+    if (addrLabelIdx !== -1) {
+      const addrParts: string[] = [];
+      // Inline value on the "Address:" line itself (after the label)
+      const inlineAddr = lines[addrLabelIdx].replace(/^address\s*[:\-]?\s*/i, '').trim();
+      if (inlineAddr) addrParts.push(inlineAddr);
+
+      // Collect continuation lines until we hit a known stop pattern
+      for (let i = addrLabelIdx + 1; i <= Math.min(addrLabelIdx + 5, lines.length - 1); i++) {
+        const ln = lines[i];
+        // Stop at field labels (mobile, phone, email, payment, S.No, bill section, etc.)
+        if (/^(mobile|phone|email|payment|s\.?no|item|qty|rate|amount|subtotal|total|bill|notes?)\b/i.test(ln)) break;
+        // Stop if line is just digits (could be a number column or section divider)
+        if (/^\d+$/.test(ln)) break;
+        // Stop if line contains price-like patterns (₹ or decimals)
+        if (/₹|^\d+\.\d{2}$/.test(ln)) break;
+        addrParts.push(ln);
+      }
+
+      if (addrParts.length > 0) {
+        result.customer_address = addrParts.join(', ').trim();
+      }
+    }
+  }
+  // NOTE: No global fallback scan for mobile — it would pick up The Scrap Co.'s own business number
+
+  // ── Address fallback: if not found in BILL TO section, try global search ──
+  // (handles receipts where address appears outside a bill section)
+  if (!result.customer_address) {
+    const globalAddrMatch = text.match(/Address\s*[:\-]?\s*(.+)/i);
+    if (globalAddrMatch) {
+      result.customer_address = globalAddrMatch[1].trim();
+    }
+  }
 
   // ── Items table ────────────────────────────────────────────────────────────
   // Look for lines between "S.NO / ITEMS" header and subtotal
@@ -575,7 +612,7 @@ telegramRouter.patch(
         // Check for existing customer by phone
         const { data: allCustomers } = await supabase
           .from("erp_customers")
-          .select("id, phone")
+          .select("id, phone, address")
           .eq("is_active", true);
 
         const match = (allCustomers ?? []).find(
@@ -584,12 +621,12 @@ telegramRouter.patch(
 
         if (match) {
           customerId = match.id;
+          // Always update address if receipt has one (fills blank, or refreshes with latest)
           if (tgReceipt.customer_address) {
             await supabase
               .from("erp_customers")
               .update({ address: tgReceipt.customer_address })
-              .eq("id", match.id)
-              .is("address", null);
+              .eq("id", match.id);
           }
         } else if (tgReceipt.customer_name) {
           // Auto-create customer
