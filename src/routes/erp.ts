@@ -605,7 +605,7 @@ erpRouter.get("/customers", async (req, res) => {
     let queryBuilder = supabase.from("erp_customers").select("*").eq("is_active", true);
 
     if (search) {
-      queryBuilder = queryBuilder.or(`name.ilike.%${search}%,phone.ilike.%${search}%,whatsapp.ilike.%${search}%,upi.ilike.%${search}%`);
+      queryBuilder = queryBuilder.or(`name.ilike.%${search}%,phone.ilike.%${search}%,whatsapp.ilike.%${search}%,upi.ilike.%${search}%,address.ilike.%${search}%`);
     }
 
     const { data: customers, error } = await queryBuilder
