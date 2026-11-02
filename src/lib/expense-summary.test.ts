@@ -50,6 +50,25 @@ test("getExpensePeriodBounds generates correct comparison periods for month view
   assert.equal(bounds.ytdStart, "2026-01-01");
 });
 
+test("getExpensePeriodBounds compares a quarter to the previous quarter", () => {
+  // Q1 FY (Apr–Jun) vs Jan–Mar, even though the two have different day counts
+  const bounds = getExpensePeriodBounds("2026-04-01", "2026-06-30");
+  assert.equal(bounds.prevStart, "2026-01-01");
+  assert.equal(bounds.prevEnd, "2026-03-31");
+});
+
+test("getExpensePeriodBounds compares a financial year to the previous one", () => {
+  const bounds = getExpensePeriodBounds("2026-04-01", "2027-03-31");
+  assert.equal(bounds.prevStart, "2025-04-01");
+  assert.equal(bounds.prevEnd, "2026-03-31");
+});
+
+test("getExpensePeriodBounds compares January to the previous December", () => {
+  const bounds = getExpensePeriodBounds("2026-01-01", "2026-01-31");
+  assert.equal(bounds.prevStart, "2025-12-01");
+  assert.equal(bounds.prevEnd, "2025-12-31");
+});
+
 test("aggregateExpenseRows: approved-only, regression math (599 vs 8699 = -93.1%), and category sorting", () => {
   const bounds = {
     periodStart: "2026-10-01",

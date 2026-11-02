@@ -2570,6 +2570,7 @@ const expenseSchema = z.object({
   ),
   description:    z.string().trim().optional().nullable(),
   vendor:         z.string().trim().max(150).optional().nullable(),
+  spent_by:       z.string().trim().max(100).optional().nullable(),
   payment_method: z.enum(["cash", "upi", "card", "bank"]).default("cash"),
   is_recurring:   z.boolean().default(false),
   gst_amount:     z.number().nonnegative().default(0),
@@ -2641,7 +2642,7 @@ erpRouter.get("/expenses", async (req, res) => {
     let query = supabase
       .from("erp_expenses")
       .select(`
-        id, expense_number, amount, expense_date, description, vendor,
+        id, expense_number, amount, expense_date, description, vendor, spent_by,
         payment_method, receipt_url, is_recurring, paid_by, approval_status,
         reimbursement_status, is_void, gst_amount, vendor_gstin,
         created_at, updated_at,
@@ -2655,7 +2656,7 @@ erpRouter.get("/expenses", async (req, res) => {
     if (to)              query = query.lte("expense_date", to);
     if (category_id)     query = query.eq("category_id", category_id);
     if (approval_status) query = query.eq("approval_status", approval_status);
-    if (search)          query = query.or(`description.ilike.%${search}%,vendor.ilike.%${search}%`);
+    if (search)          query = query.or(`description.ilike.%${search}%,vendor.ilike.%${search}%,spent_by.ilike.%${search}%`);
 
     const { data, error, count } = await query;
     if (error) throw error;
@@ -2724,6 +2725,7 @@ erpRouter.post("/expenses", async (req, res) => {
         expense_date:         body.expense_date,
         description:          body.description ?? null,
         vendor:               body.vendor ?? null,
+        spent_by:             body.spent_by ?? null,
         payment_method:       body.payment_method,
         is_recurring:         body.is_recurring,
         gst_amount:           body.gst_amount,

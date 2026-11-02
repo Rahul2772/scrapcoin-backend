@@ -25,21 +25,23 @@ export function getExpensePeriodBounds(from?: string, to?: string) {
     const periodStart = from;
     const periodEnd = to;
 
-    // Check if it's a full calendar month (e.g. YYYY-MM-01 to YYYY-MM-lastDay)
+    // Check if it spans whole calendar months (e.g. YYYY-MM-01 to YYYY-MM-lastDay)
     const [fromY, fromM, fromD] = from.split("-").map(Number);
     const [toY, toM, toD] = to.split("-").map(Number);
-    const lastDayFromMonth = new Date(Date.UTC(fromY, fromM, 0)).getUTCDate();
 
     let prevStart: string;
     let prevEnd: string;
 
-    if (fromD === 1 && fromY === toY && fromM === toM && toD === lastDayFromMonth) {
-      // Exactly one calendar month -> compare to previous calendar month
-      const prevMonthYear = fromM === 1 ? fromY - 1 : fromY;
-      const prevMonth = fromM === 1 ? 12 : fromM - 1;
-      const prevLastDay = new Date(Date.UTC(prevMonthYear, prevMonth, 0)).getUTCDate();
-      prevStart = `${prevMonthYear}-${String(prevMonth).padStart(2, "0")}-01`;
-      prevEnd = `${prevMonthYear}-${String(prevMonth).padStart(2, "0")}-${String(prevLastDay).padStart(2, "0")}`;
+    const lastDayToMonth = new Date(Date.UTC(toY, toM, 0)).getUTCDate();
+    const monthSpan = (toY * 12 + toM) - (fromY * 12 + fromM) + 1;
+
+    if (fromD === 1 && toD === lastDayToMonth && monthSpan >= 1) {
+      // Whole calendar months (month / quarter / year) -> compare to the same
+      // number of whole months immediately before
+      const prevStartDate = new Date(Date.UTC(fromY, fromM - 1 - monthSpan, 1));
+      const prevEndDate = new Date(Date.UTC(fromY, fromM - 1, 0));
+      prevStart = prevStartDate.toISOString().split("T")[0];
+      prevEnd = prevEndDate.toISOString().split("T")[0];
     } else {
       // Arbitrary date range: shift back by same duration in days
       const startMs = new Date(from).getTime();
