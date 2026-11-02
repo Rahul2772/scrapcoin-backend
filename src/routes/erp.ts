@@ -35,6 +35,23 @@ async function refreshAvgCostPerUnit(materialId: string): Promise<void> {
   }
 }
 
+// ── HELPER: Next sequential document number (e.g. TXN-00046, INV-00046) ──────
+// Based on the highest existing number, not the row count, so deleting a
+// record never causes the next number to collide with an existing one.
+async function nextDocNumber(table: string, column: string, prefix: string): Promise<string> {
+  const { data, error } = await supabase
+    .from(table)
+    .select(column)
+    .like(column, `${prefix}-%`)
+    .order(column, { ascending: false })
+    .limit(1);
+  if (error) throw error;
+
+  const last = (data?.[0] as unknown as Record<string, string> | undefined)?.[column] || "";
+  const lastNum = parseInt(last.slice(prefix.length + 1).split("/")[0], 10) || 0;
+  return `${prefix}-${String(lastNum + 1).padStart(5, "0")}`;
+}
+
 // ── ZOD SCHEMAS ──────────────────────────────────────────────────────────────
 
 const materialSchema = z.object({
@@ -89,8 +106,6 @@ const transactionSchema = z.object({
     price_per_unit: z.number().nonnegative(),
     gst_rate: z.number().min(0).max(100).optional().default(0),
   })).optional(),
-  // Optional: link to an existing sale batch (for edits)
-  sale_batch_id: z.string().uuid().optional().nullable(),
 });
 
 const purchaseReceiptSchema = z.object({
@@ -924,7 +939,7 @@ erpRouter.get("/transactions", async (req, res) => {
         *,
         erp_suppliers(name, phone),
         erp_materials(name, unit, color_hex),
-        erp_invoices(invoice_number, status)
+        erp_invoices(id, invoice_number, status, due_date, paid_at, payment_method)
       `);
 
     if (supplier_id) queryBuilder = queryBuilder.eq("supplier_id", String(supplier_id));
@@ -965,6 +980,9 @@ erpRouter.get("/transactions", async (req, res) => {
         invoice_number: invoices?.invoice_number || "",
         invoice_status: invoices?.status || "pending",
         invoice_id: invoices?.id || null,
+        due_date: invoices?.due_date || null,
+        paid_at: invoices?.paid_at || null,
+        payment_method: invoices?.payment_method || null,
       };
     });
 
@@ -1031,179 +1049,202 @@ erpRouter.get("/transactions/:id", async (req, res) => {
   }
 });
 
-// POST /api/erp/transactions — Create scale transaction, auto-invoice & update stock
+type SaleItem = { material_id: string; weight: number; price_per_unit: number; gst_rate: number };
+
+// Normalize body into a list of sale lines (multi-item `items` or legacy single-entry fields)
+function saleItemsFrom(data: z.infer<typeof transactionSchema>): SaleItem[] | null {
+  if (data.items && data.items.length > 0) return data.items;
+  if (!data.material_id || !data.weight || data.price_per_unit === undefined) return null;
+  return [{
+    material_id: data.material_id,
+    weight: data.weight,
+    price_per_unit: data.price_per_unit,
+    gst_rate: data.gst_rate ?? 0,
+  }];
+}
+
+function lineTotals(item: SaleItem) {
+  const subtotal = Number((item.weight * item.price_per_unit).toFixed(2));
+  const gst_amount = Number(((subtotal * item.gst_rate) / 100).toFixed(2));
+  const total_amount = Number((subtotal + gst_amount).toFixed(2));
+  return { subtotal, gst_amount, total_amount };
+}
+
+// Insert sale lines (TXN-00045 or TXN-00045/1, /2 ...) linked to one invoice and deduct stock
+async function insertSaleLines(opts: {
+  baseTxnNum: string;
+  items: SaleItem[];
+  materials: Record<string, any>;
+  supplier_id: string;
+  invoice_id: string;
+  notes: string | null | undefined;
+  created_by: string | undefined;
+  created_at?: string;
+}) {
+  const { baseTxnNum, items, materials } = opts;
+  const inserted: any[] = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const material = materials[item.material_id];
+
+    const txnPayload: any = {
+      txn_number: items.length > 1 ? `${baseTxnNum}/${i + 1}` : baseTxnNum,
+      supplier_id: opts.supplier_id,
+      material_id: item.material_id,
+      weight: item.weight,
+      unit: material.unit,
+      price_per_unit: item.price_per_unit,
+      gst_rate: item.gst_rate,
+      ...lineTotals(item),
+      notes: opts.notes,
+      created_by: opts.created_by,
+      invoice_id: opts.invoice_id,
+      ...(opts.created_at ? { created_at: opts.created_at } : {}),
+    };
+
+    const { data: txn, error: insertErr } = await supabase
+      .from("erp_transactions")
+      .insert(txnPayload)
+      .select()
+      .single();
+
+    if (insertErr) throw insertErr;
+    inserted.push(txn);
+
+    // Deduct from material stock — selling to recycler reduces inventory.
+    // Re-read stock so repeated materials in one sale deduct correctly.
+    const { data: freshMat } = await supabase
+      .from("erp_materials")
+      .select("stock_qty")
+      .eq("id", item.material_id)
+      .single();
+    const currentStock = freshMat ? Number(freshMat.stock_qty) : Number(material.stock_qty);
+
+    await supabase
+      .from("erp_materials")
+      .update({
+        stock_qty: Math.max(0, currentStock - item.weight),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", item.material_id);
+  }
+
+  return inserted;
+}
+
+// Look up the supplier and every material of a sale; returns an error message if any is missing
+async function validateSale(supplier_id: string, items: SaleItem[]) {
+  const { data: supplier, error: sErr } = await supabase.from("erp_suppliers").select("id, name").eq("id", supplier_id).eq("is_active", true).single();
+  if (sErr || !supplier) return { error: "Recycler not found or inactive." } as const;
+
+  const materials: Record<string, any> = {};
+  for (const item of items) {
+    const { data: mat, error: mErr } = await supabase
+      .from("erp_materials")
+      .select("id, name, unit, stock_qty")
+      .eq("id", item.material_id)
+      .eq("is_active", true)
+      .single();
+    if (mErr || !mat) return { error: `Material not found or inactive: ${item.material_id}` } as const;
+    materials[item.material_id] = mat;
+  }
+  return { supplier, materials } as const;
+}
+
+// All lines of a sale share the base ticket number (TXN-00045, TXN-00045/1, ...)
+async function fetchSaleLines(baseTxnNum: string) {
+  const { data, error } = await supabase
+    .from("erp_transactions")
+    .select("*")
+    .or(`txn_number.eq.${baseTxnNum},txn_number.like.${baseTxnNum}/%`);
+  if (error) throw error;
+  return data || [];
+}
+
+// Restore stock for sale lines and delete them
+async function removeSaleLines(lines: any[]) {
+  for (const line of lines) {
+    const { data: material } = await supabase
+      .from("erp_materials")
+      .select("stock_qty")
+      .eq("id", line.material_id)
+      .single();
+    if (material) {
+      await supabase
+        .from("erp_materials")
+        .update({
+          stock_qty: Number(material.stock_qty) + Number(line.weight),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", line.material_id);
+    }
+
+    const { error: deleteErr } = await supabase.from("erp_transactions").delete().eq("id", line.id);
+    if (deleteErr) throw deleteErr;
+  }
+}
+
+// POST /api/erp/transactions — Create scale ticket (one line per material), one invoice for the sale & update stock
 erpRouter.post("/transactions", async (req, res) => {
   const parsed = transactionSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(422).json({ success: false, errors: parsed.error.flatten() });
   }
 
-  const { supplier_id, notes, due_date, payment_method, items, created_at } = parsed.data;
+  const { supplier_id, notes, due_date, payment_method, created_at } = parsed.data;
+  const items = saleItemsFrom(parsed.data);
+  if (!items) {
+    return res.status(422).json({ success: false, message: "Either items or material_id, weight and price_per_unit are required." });
+  }
 
   try {
-    let itemsToInsert: Array<{ material_id: string; weight: number; price_per_unit: number; gst_rate: number }> = [];
+    const checked = await validateSale(supplier_id, items);
+    if ("error" in checked) return res.status(404).json({ success: false, message: checked.error });
 
-    if (items && items.length > 0) {
-      itemsToInsert = items;
-    } else {
-      if (!parsed.data.material_id || !parsed.data.weight || parsed.data.price_per_unit === undefined) {
-        return res.status(422).json({ success: false, message: "Either items or material_id, weight and price_per_unit are required." });
-      }
-      itemsToInsert = [{
-        material_id: parsed.data.material_id,
-        weight: parsed.data.weight,
-        price_per_unit: parsed.data.price_per_unit,
-        gst_rate: parsed.data.gst_rate ?? 0
-      }];
-    }
+    const baseTxnNum = await nextDocNumber("erp_transactions", "txn_number", "TXN");
+    const invoiceNumber = await nextDocNumber("erp_invoices", "invoice_number", "INV");
+    const saleTotal = Number(items.reduce((sum, item) => sum + lineTotals(item).total_amount, 0).toFixed(2));
 
-    // 1. Verify supplier exists
-    const { data: supplier, error: sErr } = await supabase.from("erp_suppliers").select("id, name").eq("id", supplier_id).eq("is_active", true).single();
-    if (sErr || !supplier) return res.status(404).json({ success: false, message: "Supplier not found or inactive." });
-
-    // 2. Generate sequential base txn_number
-    const { count: txnCount, error: countErr } = await supabase.from("erp_transactions").select("*", { count: "exact", head: true });
-    if (countErr) throw countErr;
-    const baseTxnNum = `TXN-${String((txnCount || 0) + 1).padStart(5, "0")}`;
-
-    // 3. Generate sequential base invoice_number
-    const { count: invCount, error: invCountErr } = await supabase.from("erp_invoices").select("*", { count: "exact", head: true });
-    if (invCountErr) throw invCountErr;
-    const baseInvNum = `INV-${String((invCount || 0) + 1).padStart(5, "0")}`;
-
-    let firstTxn: any = null;
-    let firstInvoice: any = null;
-
-    // 4a. If multiple materials — create one sale batch to group them
-    let saleBatchId: string | null = null;
-    if (itemsToInsert.length > 1) {
-      const batchTotal = itemsToInsert.reduce((sum, item) => {
-        const subtotal = item.weight * item.price_per_unit;
-        const gst = (subtotal * (item.gst_rate ?? 0)) / 100;
-        return sum + subtotal + gst;
-      }, 0);
-
-      const { count: batchCount } = await supabase
-        .from("erp_sale_batches")
-        .select("*", { count: "exact", head: true });
-      const batchNumber = `BATCH-${String((batchCount || 0) + 1).padStart(5, "0")}`;
-
-      const { data: batch, error: batchErr } = await supabase
-        .from("erp_sale_batches")
-        .insert({
-          batch_number: batchNumber,
-          supplier_id,
-          total_amount: Number(batchTotal.toFixed(2)),
-          payment_status: payment_method ? "paid" : "pending",
-          payment_method: payment_method || null,
-          due_date: due_date || null,
-          paid_at: payment_method ? (created_at || new Date().toISOString()) : null,
-          notes: notes || null,
-          created_by: req.privilegedUser?.id || null,
-          ...(created_at ? { created_at } : {}),
-        })
-        .select()
-        .single();
-
-      if (batchErr) throw batchErr;
-      saleBatchId = batch.id;
-    }
-
-    // 4b. Loop insert B2B items
-    for (let i = 0; i < itemsToInsert.length; i++) {
-      const item = itemsToInsert[i];
-
-      // Verify material exists
-      const { data: material, error: mErr } = await supabase.from("erp_materials").select("id, name, unit, stock_qty").eq("id", item.material_id).eq("is_active", true).single();
-      if (mErr || !material) return res.status(404).json({ success: false, message: `Material not found or inactive: ${item.material_id}` });
-
-      const subtotal = Number((item.weight * item.price_per_unit).toFixed(2));
-      const gst_amount = Number(((subtotal * item.gst_rate) / 100).toFixed(2));
-      const total_amount = Number((subtotal + gst_amount).toFixed(2));
-
-      const txn_number = itemsToInsert.length > 1 ? `${baseTxnNum}/${i + 1}` : baseTxnNum;
-
-      // Create transaction
-      const txnPayload: any = {
-        txn_number,
+    const { data: invoice, error: invoiceErr } = await supabase
+      .from("erp_invoices")
+      .insert({
+        invoice_number: invoiceNumber,
         supplier_id,
-        material_id: item.material_id,
-        weight: item.weight,
-        unit: material.unit,
-        price_per_unit: item.price_per_unit,
-        subtotal,
-        gst_rate: item.gst_rate,
-        gst_amount,
-        total_amount,
-        notes,
-        created_by: req.privilegedUser?.id,
-        // Link to batch if multi-material sale
-        ...(saleBatchId ? { sale_batch_id: saleBatchId } : {}),
-      };
-      if (created_at) {
-        txnPayload.created_at = created_at;
-      }
-
-      const { data: txn, error: insertErr } = await supabase
-        .from("erp_transactions")
-        .insert(txnPayload)
-        .select()
-        .single();
-
-      if (insertErr) throw insertErr;
-
-      // Deduct from material stock — selling to recycler reduces inventory
-      await supabase
-        .from("erp_materials")
-        .update({
-          stock_qty: Math.max(0, Number(material.stock_qty) - item.weight),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", item.material_id);
-
-      const invoice_number = itemsToInsert.length > 1 ? `${baseInvNum}/${i + 1}` : baseInvNum;
-
-      // Auto-create invoice
-      const invPayload: any = {
-        invoice_number,
-        transaction_id: txn.id,
-        supplier_id,
-        amount: total_amount,
+        amount: saleTotal,
         due_date: due_date || null,
         payment_method: payment_method || null,
         status: payment_method ? "paid" : "pending",
         paid_at: payment_method ? (created_at || new Date().toISOString()) : null,
-      };
-      if (created_at) {
-        invPayload.created_at = created_at;
-      }
+        ...(created_at ? { created_at } : {}),
+      })
+      .select()
+      .single();
 
-      const { data: invoice, error: invoiceErr } = await supabase
-        .from("erp_invoices")
-        .insert(invPayload)
-        .select()
-        .single();
+    if (invoiceErr) throw invoiceErr;
 
-      if (invoiceErr) throw invoiceErr;
-
-      if (i === 0) {
-        firstTxn = {
-          ...txn,
-          material_name: material.name,
-          supplier_name: supplier.name,
-        };
-        firstInvoice = invoice;
-      }
-    }
+    const lines = await insertSaleLines({
+      baseTxnNum,
+      items,
+      materials: checked.materials,
+      supplier_id,
+      invoice_id: invoice.id,
+      notes,
+      created_by: req.privilegedUser?.id,
+      created_at: created_at || undefined,
+    });
 
     res.status(201).json({
       success: true,
-      message: itemsToInsert.length > 1
-        ? `Bulk sale batch ${saleBatchId ? "(BATCH created)" : ""} with ${itemsToInsert.length} materials recorded.`
-        : "Scale transaction recorded and invoice created.",
-      transaction: firstTxn,
-      invoice: firstInvoice,
-      sale_batch_id: saleBatchId,
+      message: items.length > 1
+        ? `Sale with ${items.length} materials recorded and invoice ${invoiceNumber} created.`
+        : `Scale transaction recorded and invoice ${invoiceNumber} created.`,
+      transaction: {
+        ...lines[0],
+        material_name: checked.materials[items[0].material_id].name,
+        supplier_name: checked.supplier.name,
+      },
+      invoice,
     });
   } catch (err: any) {
     console.error("POST /api/erp/transactions error:", err);
@@ -1211,118 +1252,37 @@ erpRouter.post("/transactions", async (req, res) => {
   }
 });
 
-// GET /api/erp/sale-batches — List all multi-material bulk sale batches
-erpRouter.get("/sale-batches", async (req, res) => {
-  try {
-    const { data: batches, error } = await supabase
-      .from("erp_sale_batches")
-      .select(`
-        *,
-        erp_suppliers(name, phone),
-        erp_transactions(id, txn_number, material_id, weight, unit, price_per_unit, total_amount,
-          erp_materials(name, category))
-      `)
-      .order("created_at", { ascending: false })
-      .limit(200);
-
-    if (error) throw error;
-
-    const formatted = (batches || []).map((b: any) => ({
-      id: b.id,
-      batch_number: b.batch_number,
-      supplier_id: b.supplier_id,
-      supplier_name: b.erp_suppliers?.name || "Unknown",
-      total_amount: Number(b.total_amount),
-      payment_status: b.payment_status,
-      payment_method: b.payment_method,
-      due_date: b.due_date,
-      paid_at: b.paid_at,
-      notes: b.notes,
-      created_at: b.created_at,
-      lines: (b.erp_transactions || []).map((t: any) => ({
-        txn_number: t.txn_number,
-        material_id: t.material_id,
-        material_name: t.erp_materials?.name || "",
-        material_category: t.erp_materials?.category || "",
-        weight: Number(t.weight),
-        unit: t.unit,
-        price_per_unit: Number(t.price_per_unit),
-        total_amount: Number(t.total_amount),
-      })),
-    }));
-
-    res.json({ success: true, count: formatted.length, batches: formatted });
-  } catch (err: any) {
-    console.error("GET /api/erp/sale-batches error:", err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-
+// PUT /api/erp/transactions/:id — Replace the lines of a sale, keeping its ticket and invoice numbers
 erpRouter.put("/transactions/:id", async (req, res) => {
   const parsed = transactionSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(422).json({ success: false, errors: parsed.error.flatten() });
   }
 
-  const txnId = req.params.id;
-  const { supplier_id, notes, due_date, payment_method, items, created_at } = parsed.data;
+  const { supplier_id, notes, due_date, payment_method, created_at } = parsed.data;
+  const items = saleItemsFrom(parsed.data);
+  if (!items) {
+    return res.status(422).json({ success: false, message: "Either items or material_id, weight and price_per_unit are required." });
+  }
 
   try {
-    // 1. Fetch old transaction
     const { data: oldTxn, error: fetchErr } = await supabase
       .from("erp_transactions")
       .select("*")
-      .eq("id", txnId)
+      .eq("id", req.params.id)
       .single();
 
     if (fetchErr || !oldTxn) {
       return res.status(404).json({ success: false, message: "Transaction not found" });
     }
 
+    // Validate new items FIRST before modifying DB
+    const checked = await validateSale(supplier_id, items);
+    if ("error" in checked) return res.status(404).json({ success: false, message: checked.error });
+
     const baseTxnNum = oldTxn.txn_number.split("/")[0];
-
-    // Find all siblings
-    const { data: siblings, error: sibErr } = await supabase
-      .from("erp_transactions")
-      .select("*")
-      .or(`txn_number.eq.${baseTxnNum},txn_number.like.${baseTxnNum}/%`);
-
-    if (sibErr) throw sibErr;
-
-    // 2. Normalize and validate new items FIRST before modifying DB
-    let itemsToInsert: Array<{ material_id: string; weight: number; price_per_unit: number; gst_rate: number }> = [];
-
-    if (items && items.length > 0) {
-      itemsToInsert = items;
-    } else {
-      if (!parsed.data.material_id || !parsed.data.weight || parsed.data.price_per_unit === undefined) {
-        return res.status(422).json({ success: false, message: "Either items or material_id, weight and price_per_unit are required." });
-      }
-      itemsToInsert = [{
-        material_id: parsed.data.material_id,
-        weight: parsed.data.weight,
-        price_per_unit: parsed.data.price_per_unit,
-        gst_rate: parsed.data.gst_rate ?? 0
-      }];
-    }
-
-    // Verify supplier exists
-    const { data: supplier, error: sErr } = await supabase.from("erp_suppliers").select("id, name").eq("id", supplier_id).eq("is_active", true).single();
-    if (sErr || !supplier) return res.status(404).json({ success: false, message: "Recycler not found or inactive." });
-
-    // Verify all new materials exist
-    const validatedMaterials: Record<string, any> = {};
-    for (const item of itemsToInsert) {
-      const { data: mat, error: mErr } = await supabase
-        .from("erp_materials")
-        .select("id, name, unit, stock_qty")
-        .eq("id", item.material_id)
-        .eq("is_active", true)
-        .single();
-      if (mErr || !mat) return res.status(404).json({ success: false, message: `Material not found or inactive: ${item.material_id}` });
-      validatedMaterials[item.material_id] = mat;
-    }
+    const oldLines = await fetchSaleLines(baseTxnNum);
+    const invoiceId = oldLines.find((l) => l.invoice_id)?.invoice_id || null;
 
     // Preserve creation date unless explicitly provided with a valid date string
     let targetCreatedAt = oldTxn.created_at;
@@ -1333,126 +1293,68 @@ erpRouter.put("/transactions/:id", async (req, res) => {
       }
     }
 
-    // 3. Revert stock, delete old invoices and transaction rows
-    const oldSiblings = siblings || [];
-    for (const sib of oldSiblings) {
-      // Revert stock — restore material that was sold (undo deduction)
-      const { data: material } = await supabase
-        .from("erp_materials")
-        .select("stock_qty")
-        .eq("id", sib.material_id)
-        .single();
-      if (material) {
-        await supabase
-          .from("erp_materials")
-          .update({
-            stock_qty: Number(material.stock_qty) + Number(sib.weight),
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", sib.material_id);
-      }
+    const saleTotal = Number(items.reduce((sum, item) => sum + lineTotals(item).total_amount, 0).toFixed(2));
+    const { data: existingInvoice } = invoiceId
+      ? await supabase.from("erp_invoices").select("*").eq("id", invoiceId).single()
+      : { data: null };
 
-      await supabase.from("erp_invoices").delete().eq("transaction_id", sib.id);
-      await supabase.from("erp_transactions").delete().eq("id", sib.id);
-    }
+    const invoiceFields: any = {
+      supplier_id,
+      amount: saleTotal,
+      due_date: payment_method ? null : due_date || null,
+      payment_method: payment_method || null,
+      status: payment_method
+        ? "paid"
+        : existingInvoice?.status === "overdue" || existingInvoice?.status === "cancelled"
+          ? existingInvoice.status
+          : "pending",
+      paid_at: payment_method ? existingInvoice?.paid_at || targetCreatedAt : null,
+      created_at: targetCreatedAt,
+      updated_at: new Date().toISOString(),
+    };
 
-    // 4. Generate base invoice_number prefix
-    const { count: invCount } = await supabase.from("erp_invoices").select("*", { count: "exact", head: true });
-    const baseInvNum = `INV-${String((invCount || 0) + 1).padStart(5, "0")}`;
-
-    let firstTxn: any = null;
-    let firstInvoice: any = null;
-
-    // 5. Loop insert B2B items under baseTxnNum
-    for (let i = 0; i < itemsToInsert.length; i++) {
-      const item = itemsToInsert[i];
-      const material = validatedMaterials[item.material_id];
-
-      const subtotal = Number((item.weight * item.price_per_unit).toFixed(2));
-      const gst_amount = Number(((subtotal * item.gst_rate) / 100).toFixed(2));
-      const total_amount = Number((subtotal + gst_amount).toFixed(2));
-
-      const txn_number = itemsToInsert.length > 1 ? `${baseTxnNum}/${i + 1}` : baseTxnNum;
-
-      const txnPayload: any = {
-        txn_number,
-        supplier_id,
-        material_id: item.material_id,
-        weight: item.weight,
-        unit: material.unit,
-        price_per_unit: item.price_per_unit,
-        subtotal,
-        gst_rate: item.gst_rate,
-        gst_amount,
-        total_amount,
-        notes,
-        created_by: req.privilegedUser?.id,
-        created_at: targetCreatedAt,
-        updated_at: new Date().toISOString(),
-      };
-
-      const { data: txn, error: insertErr } = await supabase
-        .from("erp_transactions")
-        .insert(txnPayload)
-        .select()
-        .single();
-
-      if (insertErr) throw insertErr;
-
-      // Fetch fresh material stock to deduct sold quantity
-      const { data: freshMat } = await supabase
-        .from("erp_materials")
-        .select("stock_qty")
-        .eq("id", item.material_id)
-        .single();
-      const currentStock = freshMat ? Number(freshMat.stock_qty) : Number(material.stock_qty);
-
-      await supabase
-        .from("erp_materials")
-        .update({
-          stock_qty: Math.max(0, currentStock - item.weight),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", item.material_id);
-
-      const invoice_number = itemsToInsert.length > 1 ? `${baseInvNum}/${i + 1}` : baseInvNum;
-
-      const invPayload: any = {
-        invoice_number,
-        transaction_id: txn.id,
-        supplier_id,
-        amount: total_amount,
-        due_date: due_date || null,
-        payment_method: payment_method || null,
-        status: payment_method ? "paid" : "pending",
-        paid_at: payment_method ? targetCreatedAt : null,
-        created_at: targetCreatedAt,
-        updated_at: new Date().toISOString(),
-      };
-
-      const { data: invoice, error: invoiceErr } = await supabase
+    let invoice: any;
+    if (existingInvoice) {
+      const { data, error } = await supabase
         .from("erp_invoices")
-        .insert(invPayload)
+        .update(invoiceFields)
+        .eq("id", existingInvoice.id)
         .select()
         .single();
-
-      if (invoiceErr) throw invoiceErr;
-
-      if (i === 0) {
-        firstTxn = {
-          ...txn,
-          material_name: material.name,
-          supplier_name: supplier.name,
-        };
-        firstInvoice = invoice;
-      }
+      if (error) throw error;
+      invoice = data;
+    } else {
+      const { data, error } = await supabase
+        .from("erp_invoices")
+        .insert({ ...invoiceFields, invoice_number: await nextDocNumber("erp_invoices", "invoice_number", "INV") })
+        .select()
+        .single();
+      if (error) throw error;
+      invoice = data;
     }
+
+    await removeSaleLines(oldLines);
+
+    const lines = await insertSaleLines({
+      baseTxnNum,
+      items,
+      materials: checked.materials,
+      supplier_id,
+      invoice_id: invoice.id,
+      notes,
+      created_by: req.privilegedUser?.id,
+      created_at: targetCreatedAt,
+    });
 
     res.json({
       success: true,
-      message: "Scale transaction(s) and invoice(s) updated successfully.",
-      transaction: firstTxn,
-      invoice: firstInvoice,
+      message: "Sale and invoice updated successfully.",
+      transaction: {
+        ...lines[0],
+        material_name: checked.materials[items[0].material_id].name,
+        supplier_name: checked.supplier.name,
+      },
+      invoice,
     });
   } catch (err: any) {
     console.error("PUT /api/erp/transactions/:id error:", err);
@@ -1460,55 +1362,27 @@ erpRouter.put("/transactions/:id", async (req, res) => {
   }
 });
 
-// DELETE /api/erp/transactions/:id — Delete B2B txn & reverse stock (Admin only)
+// DELETE /api/erp/transactions/:id — Delete a whole sale, its invoice & reverse stock (Admin only)
 erpRouter.delete("/transactions/:id", async (req, res) => {
   if (req.privilegedUser?.role !== "admin") {
     return res.status(403).json({ success: false, message: "Admin access required." });
   }
 
   try {
-    // 1. Fetch txn
     const { data: txn, error: getErr } = await supabase.from("erp_transactions").select("*").eq("id", req.params.id).single();
     if (getErr || !txn) return res.status(404).json({ success: false, message: "Transaction not found." });
 
-    const baseTxnNum = txn.txn_number.split("/")[0];
+    const lines = await fetchSaleLines(txn.txn_number.split("/")[0]);
+    const invoiceIds = [...new Set(lines.map((l) => l.invoice_id).filter(Boolean))];
 
-    // Find all siblings
-    const { data: siblings, error: sibErr } = await supabase
-      .from("erp_transactions")
-      .select("*")
-      .or(`txn_number.eq.${baseTxnNum},txn_number.like.${baseTxnNum}/%`);
+    await removeSaleLines(lines);
 
-    if (sibErr) throw sibErr;
-
-    const oldSiblings = siblings || [];
-    for (const sib of oldSiblings) {
-      // Revert stock — restore material that was sold (undo the deduction)
-      const { data: material } = await supabase
-        .from("erp_materials")
-        .select("stock_qty")
-        .eq("id", sib.material_id)
-        .single();
-
-      if (material) {
-        await supabase
-          .from("erp_materials")
-          .update({
-            stock_qty: Number(material.stock_qty) + Number(sib.weight),
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", sib.material_id);
-      }
-
-      // Delete associated invoice
-      await supabase.from("erp_invoices").delete().eq("transaction_id", sib.id);
-
-      // Delete transaction row
-      const { error: deleteErr } = await supabase.from("erp_transactions").delete().eq("id", sib.id);
-      if (deleteErr) throw deleteErr;
+    if (invoiceIds.length > 0) {
+      const { error: invErr } = await supabase.from("erp_invoices").delete().in("id", invoiceIds);
+      if (invErr) throw invErr;
     }
 
-    res.json({ success: true, message: "Transaction group and associated invoice(s) deleted. Stock reversed." });
+    res.json({ success: true, message: "Sale and its invoice deleted. Stock reversed." });
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -1516,7 +1390,35 @@ erpRouter.delete("/transactions/:id", async (req, res) => {
 
 // ── 5. INVOICES (B2B) ──────────────────────────────────────────────────────────
 
-// GET /api/erp/invoices — List B2B invoices + summaries
+// Sale lines of an invoice (embedded erp_transactions) → sorted line list + roll-ups
+function invoiceLines(i: any) {
+  const lines = (i.erp_transactions || [])
+    .slice()
+    .sort((a: any, b: any) => String(a.txn_number).localeCompare(String(b.txn_number)))
+    .map((t: any) => ({
+      transaction_id: t.id,
+      txn_number: t.txn_number,
+      material_name: t.erp_materials?.name || "",
+      category: t.erp_materials?.category || "",
+      weight: Number(t.weight || 0),
+      unit: t.unit || "kg",
+      price_per_unit: Number(t.price_per_unit || 0),
+      subtotal: Number(t.subtotal || 0),
+      gst_rate: Number(t.gst_rate || 0),
+      gst_amount: Number(t.gst_amount || 0),
+      total_amount: Number(t.total_amount || 0),
+    }));
+
+  return {
+    txn_number: lines[0] ? lines[0].txn_number.split("/")[0] : "",
+    material_name: lines.map((l: any) => l.material_name).join(", "),
+    weight: Number(lines.reduce((s: number, l: any) => s + l.weight, 0).toFixed(3)),
+    unit: lines[0]?.unit || "kg",
+    lines,
+  };
+}
+
+// GET /api/erp/invoices — List B2B invoices (one per sale) + summaries
 erpRouter.get("/invoices", async (req, res) => {
   try {
     const { status, from_date, to_date, page = 1, limit = 20 } = req.query;
@@ -1526,7 +1428,7 @@ erpRouter.get("/invoices", async (req, res) => {
       .select(`
         *,
         erp_suppliers(name, phone),
-        erp_transactions(txn_number, weight, unit, price_per_unit, material_id, erp_materials(name))
+        erp_transactions(id, txn_number, weight, unit, price_per_unit, subtotal, gst_rate, gst_amount, total_amount, erp_materials(name, category))
       `);
 
     if (status) queryBuilder = queryBuilder.eq("status", String(status));
@@ -1543,7 +1445,6 @@ erpRouter.get("/invoices", async (req, res) => {
     const formatted = (data || []).map((i: any) => ({
       id: i.id,
       invoice_number: i.invoice_number,
-      transaction_id: i.transaction_id,
       supplier_id: i.supplier_id,
       amount: Number(i.amount),
       status: i.status,
@@ -1554,11 +1455,7 @@ erpRouter.get("/invoices", async (req, res) => {
       created_at: i.created_at,
       supplier_name: i.erp_suppliers?.name || "",
       supplier_phone: i.erp_suppliers?.phone || "",
-      txn_number: i.erp_transactions?.txn_number || "",
-      weight: Number(i.erp_transactions?.weight || 0),
-      unit: i.erp_transactions?.unit || "kg",
-      price_per_unit: Number(i.erp_transactions?.price_per_unit || 0),
-      material_name: i.erp_transactions?.erp_materials?.name || "",
+      ...invoiceLines(i),
     }));
 
     // Calculate summaries on-the-fly from database
@@ -1619,7 +1516,6 @@ erpRouter.get("/invoices/:id", async (req, res) => {
     const formatted = {
       id: i.id,
       invoice_number: i.invoice_number,
-      transaction_id: i.transaction_id,
       supplier_id: i.supplier_id,
       amount: Number(i.amount),
       status: i.status,
@@ -1634,15 +1530,7 @@ erpRouter.get("/invoices/:id", async (req, res) => {
       supplier_address: i.erp_suppliers?.address || "",
       id_type: i.erp_suppliers?.id_type || "",
       id_number: i.erp_suppliers?.id_number || "",
-      txn_number: i.erp_transactions?.txn_number || "",
-      weight: Number(i.erp_transactions?.weight || 0),
-      unit: i.erp_transactions?.unit || "kg",
-      price_per_unit: Number(i.erp_transactions?.price_per_unit || 0),
-      subtotal: Number(i.erp_transactions?.subtotal || 0),
-      gst_rate: Number(i.erp_transactions?.gst_rate || 0),
-      gst_amount: Number(i.erp_transactions?.gst_amount || 0),
-      material_name: i.erp_transactions?.erp_materials?.name || "",
-      category: i.erp_transactions?.erp_materials?.category || "",
+      ...invoiceLines(i),
     };
 
     res.json({ success: true, invoice: formatted });
