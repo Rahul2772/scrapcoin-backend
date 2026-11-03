@@ -41,6 +41,9 @@ const bookingLimiter = rateLimit({
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
+  // Only successful bookings count, so a resident fixing a typo after a
+  // 400 isn't locked out for 15 minutes.
+  skipFailedRequests: true,
 });
 
 import { isPincodeSupported } from "../lib/pincodes.js";

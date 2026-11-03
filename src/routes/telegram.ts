@@ -66,8 +66,10 @@ async function ensureStorageBucket(): Promise<boolean> {
     }
     const exists = (buckets ?? []).some((b) => b.name === STORAGE_BUCKET);
     if (!exists) {
+      // Private: receipt PDFs hold customer names, phones and addresses.
+      // The API hands out short-lived signed URLs instead.
       const { error: createErr } = await supabase.storage.createBucket(STORAGE_BUCKET, {
-        public: true,
+        public: false,
       });
       if (createErr) {
         console.warn(`[Telegram] Could not auto-create bucket "${STORAGE_BUCKET}":`, createErr.message);

@@ -275,6 +275,8 @@ CREATE INDEX IF NOT EXISTS idx_bookings_source ON bookings(source);
 
 -- =============================================================================
 -- ROW LEVEL SECURITY (RLS)
+-- NOTE: the "…_authenticated_read" policies below are replaced with staff-only
+-- policies by migration_rls_staff_only.sql. Run that file after this one.
 -- Applied to all ERP tables to block direct anon/public access.
 -- The Express backend uses SUPABASE_SERVICE_KEY which bypasses RLS entirely,
 -- so no backend queries are affected. The frontend anon key cannot read ERP
@@ -421,9 +423,9 @@ ALTER TABLE telegram_ingested_receipts
   ADD COLUMN IF NOT EXISTS purchase_receipt_id UUID
   REFERENCES erp_purchase_receipts(id) ON DELETE SET NULL;
 
--- Storage Bucket for Receipts / Invoices
+-- Storage Bucket for Receipts / Invoices (private – the API serves signed URLs)
 INSERT INTO storage.buckets (id, name, public)
-VALUES ('invoices', 'invoices', true)
+VALUES ('invoices', 'invoices', false)
 ON CONFLICT (id) DO NOTHING;
 
 -- =============================================================================
@@ -527,6 +529,12 @@ DROP TRIGGER IF EXISTS update_erp_expenses_updated_at ON erp_expenses;
 CREATE TRIGGER update_erp_expenses_updated_at
   BEFORE UPDATE ON erp_expenses
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- 5a. RLS on, no policies: only the backend (service role) touches expenses
+ALTER TABLE erp_expense_categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE erp_expenses           ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON FUNCTION nextval_expense_number() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION nextval_expense_number() TO service_role;
 
 -- 6. Storage bucket for expense receipts (private – serve via signed URLs)
 INSERT INTO storage.buckets (id, name, public)

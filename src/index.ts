@@ -9,6 +9,7 @@ import { notificationsRouter } from "./routes/notifications.js";
 import { telegramRouter } from "./routes/telegram.js";
 
 const app = express();
+app.disable("x-powered-by");
 // Behind proxies (e.g. Railway, Vercel), enable trust proxy so
 // express-rate-limit can correctly identify client IPs from
 // the X-Forwarded-For header.
