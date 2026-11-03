@@ -13,6 +13,7 @@ import { z } from "zod";
 import { supabase } from "../lib/supabase.js";
 import { requireAdminOrChampion } from "../middleware/requireAdminOrChampion.js";
 import { normalizePhone, parseReceiptText, isHighConfidence } from "../lib/receipt-parser.js";
+import { detectSociety } from "../lib/society.js";
 // pdf-parse is a CJS module — import via createRequire for ESM compatibility
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
@@ -468,6 +469,7 @@ telegramRouter.patch(
             name:        tgReceipt.customer_name,
             phone:       tgReceipt.customer_mobile,
             address:     tgReceipt.customer_address ?? null,
+            society:     detectSociety(tgReceipt.customer_address),
             created_via: "telegram_auto",
             is_active:   true,
           })

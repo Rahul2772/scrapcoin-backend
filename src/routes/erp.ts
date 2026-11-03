@@ -5,6 +5,8 @@ import { supabase } from "../lib/supabase.js";
 import { sendWhatsAppMessage } from "../lib/twilio.js";
 import { getExpenseSummaryData } from "../lib/expense-summary.js";
 import { isLegacyCategoryName } from "../constants/expense-categories.js";
+import { buildReports } from "../lib/reports.js";
+import { detectSociety } from "../lib/society.js";
 
 export const erpRouter = Router();
 
@@ -86,7 +88,15 @@ const customerSchema = z.object({
   id_number: z.string().trim().optional().nullable(),
   notes: z.string().trim().optional().nullable(),
   last_receipt_date: z.string().optional().nullable(),
+  society: z.string().trim().max(120).optional().nullable(),
+  lead_source: z.string().trim().max(50).optional().nullable(),
 });
+
+// Society names already saved on customers, so new spellings are reused
+async function savedSocieties(): Promise<string[]> {
+  const { data } = await supabase.from("erp_customers").select("society").not("society", "is", null);
+  return [...new Set((data || []).map((r: any) => String(r.society || "").trim()).filter(Boolean))];
+}
 
 const transactionSchema = z.object({
   supplier_id: z.string().uuid(),
@@ -605,7 +615,7 @@ erpRouter.get("/customers", async (req, res) => {
     let queryBuilder = supabase.from("erp_customers").select("*").eq("is_active", true);
 
     if (search) {
-      queryBuilder = queryBuilder.or(`name.ilike.%${search}%,phone.ilike.%${search}%,whatsapp.ilike.%${search}%,upi.ilike.%${search}%,address.ilike.%${search}%`);
+      queryBuilder = queryBuilder.or(`name.ilike.%${search}%,phone.ilike.%${search}%,whatsapp.ilike.%${search}%,upi.ilike.%${search}%,address.ilike.%${search}%,society.ilike.%${search}%`);
     }
 
     const { data: customers, error } = await queryBuilder
@@ -746,6 +756,11 @@ erpRouter.post("/customers", async (req, res) => {
       insertPayload.last_receipt_date = parsed.data.last_receipt_date;
     }
 
+    // Society: as entered, else suggested from the address
+    const society = parsed.data.society || detectSociety(parsed.data.address, await savedSocieties());
+    if (society) insertPayload.society = society;
+    if (parsed.data.lead_source) insertPayload.lead_source = parsed.data.lead_source;
+
     const { data, error } = await supabase
       .from("erp_customers")
       .insert(insertPayload)
@@ -806,6 +821,12 @@ erpRouter.put("/customers/:id", async (req, res) => {
     if (parsed.data.last_receipt_date !== undefined) {
       baseUpdate.last_receipt_date = parsed.data.last_receipt_date || null;
     }
+
+    // Only touch society / lead source when the caller sends them
+    if (parsed.data.society !== undefined) {
+      baseUpdate.society = parsed.data.society || detectSociety(parsed.data.address, await savedSocieties());
+    }
+    if (parsed.data.lead_source !== undefined) baseUpdate.lead_source = parsed.data.lead_source || null;
 
     const { data, error } = await supabase
       .from("erp_customers")
@@ -2273,6 +2294,56 @@ erpRouter.get("/whatsapp/logs", async (req, res) => {
 // ── 8. DASHBOARD ──────────────────────────────────────────────────────────────
 
 // GET /api/erp/dashboard — Aggregated dashboard statistics for charts & summaries
+// ── HELPER: read every row of a query (Supabase returns at most 1000 per call) ──
+async function fetchAll<T>(build: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: any }>): Promise<T[]> {
+  const rows: T[] = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await build(from, from + 999);
+    if (error) throw error;
+    rows.push(...(data || []));
+    if (!data || data.length < 1000) return rows;
+  }
+}
+
+// ── GET /api/erp/reports — profitability by bill, customer, society, source, material ──
+// Query params: from, to (YYYY-MM-DD, IST, inclusive). Both empty = all time.
+erpRouter.get("/reports", async (req, res) => {
+  if (req.privilegedUser?.role !== "admin") {
+    res.status(403).json({ success: false, message: "Admin access required" });
+    return;
+  }
+  const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+  const from = typeof req.query.from === "string" && dateRe.test(req.query.from) ? req.query.from : undefined;
+  const to = typeof req.query.to === "string" && dateRe.test(req.query.to) ? req.query.to : undefined;
+
+  try {
+    const [receipts, sales, customers, materials, expenses] = await Promise.all([
+      fetchAll<any>((a, b) => supabase.from("erp_purchase_receipts")
+        .select("receipt_number, customer_id, material_id, weight, total_amount, created_at").order("id").range(a, b)),
+      fetchAll<any>((a, b) => supabase.from("erp_transactions")
+        .select("material_id, weight, subtotal, total_amount, created_at").order("id").range(a, b)),
+      fetchAll<any>((a, b) => supabase.from("erp_customers").select("*").order("id").range(a, b)),
+      fetchAll<any>((a, b) => supabase.from("erp_materials").select("id, name, color_hex, sell_price").order("id").range(a, b)),
+      fetchAll<any>((a, b) => {
+        let q = supabase.from("erp_expenses").select("amount")
+          .eq("approval_status", "approved").eq("is_void", false);
+        if (from) q = q.gte("expense_date", from);
+        if (to) q = q.lte("expense_date", to);
+        return q.order("id").range(a, b);
+      }),
+    ]);
+
+    const report = buildReports({
+      from, to, receipts, sales, customers, materials,
+      expensesTotal: expenses.reduce((s, e) => s + Number(e.amount || 0), 0),
+    });
+    res.json({ success: true, report });
+  } catch (err: any) {
+    console.error("GET /api/erp/reports error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // Query params:
 //   period:  "month" | "quarter" | "year"  (default: "month" rolling 30 days)
 //   year:    e.g. 2026                     (default: current year)
