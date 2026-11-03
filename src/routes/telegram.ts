@@ -493,9 +493,15 @@ telegramRouter.patch(
       // 4. Map line items to material IDs via fuzzy match
       const { data: allMaterials, error: matErr } = await supabase
         .from("erp_materials")
-        .select("id, name, unit, stock_qty");
+        .select("*");
 
       if (matErr || !allMaterials) throw new Error("Failed to fetch materials catalog.");
+
+      // "METAL E WASTE", "Metal E-waste" and "metal e waste" all compare equal.
+      // A material also answers to its aliases (names of SKUs merged into it).
+      const nameKey = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+      const keysOf = (m: any): string[] =>
+        [m.name, ...(Array.isArray(m.aliases) ? m.aliases : [])].map(nameKey).filter(Boolean);
 
       const newReceiptRows: any[] = [];
       const invoiceNo = tgReceipt.purchase_no ? `TG-${tgReceipt.purchase_no}` : `TG-${String(id).split('-')[0]}`;
@@ -504,14 +510,13 @@ telegramRouter.patch(
 
       for (const item of lineItems) {
         if (!item.item_name) continue;
-        const normalizedName = item.item_name.trim().toLowerCase();
+        const normalizedName = nameKey(item.item_name);
 
-        // Exact match first, then partial/contains
-        let matchedMaterial = allMaterials.find(m => m.name.toLowerCase() === normalizedName);
-        if (!matchedMaterial) {
+        // Exact match (name or alias) first, then partial/contains
+        let matchedMaterial = allMaterials.find(m => keysOf(m).includes(normalizedName));
+        if (!matchedMaterial && normalizedName) {
           matchedMaterial = allMaterials.find(m =>
-            normalizedName.includes(m.name.toLowerCase()) ||
-            m.name.toLowerCase().includes(normalizedName)
+            keysOf(m).some(k => normalizedName.includes(k) || k.includes(normalizedName))
           );
         }
 
@@ -529,7 +534,7 @@ telegramRouter.patch(
               stock_qty: 0,
               is_active: true,
             })
-            .select("id, name, unit, stock_qty")
+            .select("*")
             .single();
 
           if (!newMatErr && newMat) {
@@ -590,10 +595,13 @@ telegramRouter.patch(
         for (const row of newReceiptRows) {
           const mat = allMaterials.find(m => m.id === row.material_id);
           if (mat) {
+            // Keep the in-memory value current: a receipt can list the same
+            // material twice, and each line must add to the previous total.
+            mat.stock_qty = Number(mat.stock_qty || 0) + Number(row.weight || 0);
             await supabase
               .from("erp_materials")
               .update({
-                stock_qty: Number(mat.stock_qty || 0) + row.weight,
+                stock_qty: mat.stock_qty,
                 updated_at: new Date().toISOString(),
               })
               .eq("id", row.material_id);
