@@ -8,6 +8,7 @@ export interface ReportReceiptLine {
   material_id: string | null;
   weight: number | string;
   total_amount: number | string;
+  payment_method?: string | null;
   created_at: string;
 }
 export interface ReportSaleLine {
@@ -53,6 +54,8 @@ const pct = (part: number, whole: number) => (whole > 0 ? Math.round((part / who
 const istDate = (iso: string) => getISTDateParts(new Date(iso)).dateStr;
 // "RCP-1004/2" and "TG-38/1" belong to bills "RCP-1004" and "TG-38"
 export const billNumber = (receiptNumber: string) => String(receiptNumber || "").split("/")[0];
+// Pickups the customer gave us for free (recorded at ₹0)
+const isDonated = (l: ReportReceiptLine) => l.payment_method === "donation";
 
 type RateSource = "period" | "all_time" | "catalogue" | "none";
 interface Rate { rate: number; source: RateSource }
@@ -121,10 +124,11 @@ export function buildReports(input: ReportInput) {
   const periodLines = lines.filter((l) => inPeriod(l.date));
 
   // ── Bills ──
-  const billMap = new Map<string, { bill_no: string; date: string; customer_id: string | null; lines: number; t: Totals; materials: Set<string> }>();
+  const billMap = new Map<string, { bill_no: string; date: string; customer_id: string | null; lines: number; donated: boolean; t: Totals; materials: Set<string> }>();
   for (const l of periodLines) {
-    const b = billMap.get(l.bill) ?? { bill_no: l.bill, date: l.date, customer_id: l.customer_id, lines: 0, t: { kg: 0, paid: 0, value: 0 }, materials: new Set<string>() };
+    const b = billMap.get(l.bill) ?? { bill_no: l.bill, date: l.date, customer_id: l.customer_id, lines: 0, donated: true, t: { kg: 0, paid: 0, value: 0 }, materials: new Set<string>() };
     b.lines++;
+    b.donated &&= isDonated(l);
     if (l.date < b.date) b.date = l.date;
     b.customer_id ??= l.customer_id;
     addTo(b.t, n(l.weight), n(l.total_amount), valueOf(l, rates));
@@ -146,6 +150,7 @@ export function buildReports(input: ReportInput) {
         customer_name: c?.name || WALK_IN,
         society: societyOf(c),
         lines: b.lines,
+        donated: b.donated,
         materials: [...b.materials],
         ...money(b.t),
       };
@@ -232,30 +237,35 @@ export function buildReports(input: ReportInput) {
     })).sort((a, b) => b.profit - a.profit);
 
   // ── Materials ──
-  const matMap = new Map<string, { bought: Totals; soldKg: number; soldAmt: number }>();
+  const newMat = () => ({ bought: { kg: 0, paid: 0, value: 0 }, donatedKg: 0, soldKg: 0, soldAmt: 0 });
+  const matMap = new Map<string, ReturnType<typeof newMat>>();
   for (const l of periodLines) {
     const id = l.material_id || "";
-    const m = matMap.get(id) ?? { bought: { kg: 0, paid: 0, value: 0 }, soldKg: 0, soldAmt: 0 };
+    const m = matMap.get(id) ?? newMat();
     addTo(m.bought, n(l.weight), n(l.total_amount), valueOf(l, rates));
+    if (isDonated(l)) m.donatedKg += n(l.weight);
     matMap.set(id, m);
   }
   for (const s of input.sales) {
     if (!inPeriod(istDate(s.created_at))) continue;
     const id = s.material_id || "";
-    const m = matMap.get(id) ?? { bought: { kg: 0, paid: 0, value: 0 }, soldKg: 0, soldAmt: 0 };
+    const m = matMap.get(id) ?? newMat();
     m.soldKg += n(s.weight);
     m.soldAmt += s.subtotal != null ? n(s.subtotal) : n(s.total_amount);
     matMap.set(id, m);
   }
   const materials = [...matMap].map(([id, m]) => {
     const mat = mats.get(id);
-    const buyRate = m.bought.kg > 0 ? m.bought.paid / m.bought.kg : null;
+    // The rate we pay sellers: donated kg cost nothing, so they'd drag it down
+    const paidKg = m.bought.kg - m.donatedKg;
+    const buyRate = paidKg > 0 ? m.bought.paid / paidKg : null;
     const rate = rates[id];
     return {
       material_id: id || null,
       name: mat?.name || "Unknown",
       color_hex: mat?.color_hex || "#f5a623",
       kg_bought: r2(m.bought.kg),
+      kg_donated: r2(m.donatedKg),
       paid: r2(m.bought.paid),
       avg_buy_rate: buyRate == null ? null : r2(buyRate),
       kg_sold: r2(m.soldKg),
@@ -287,6 +297,7 @@ export function buildReports(input: ReportInput) {
     .filter((c) => c.days_since_last >= reengageAfter)
     .sort((a, b) => b.lifetime_profit - a.lifetime_profit);
 
+  const donatedBills = bills.filter((b) => b.donated);
   const base = money(totals);
   return {
     period: { from: input.from || null, to: input.to || null },
@@ -299,6 +310,12 @@ export function buildReports(input: ReportInput) {
       cost_per_pickup: r2(costPerPickup),
       profit_per_pickup: pickups ? r2(base.profit / pickups) : 0,
       kg_per_pickup: pickups ? r2(totals.kg / pickups) : 0,
+      // Included in the figures above; shown so donations don't read as buying margin
+      donated: {
+        pickups: donatedBills.length,
+        kg: r2(donatedBills.reduce((s, b) => s + b.kg, 0)),
+        est_value: r2(donatedBills.reduce((s, b) => s + b.est_value, 0)),
+      },
       unpriced_materials: materials.filter((m) => m.rate_source === "none" && m.kg_bought > 0).map((m) => m.name),
     },
     bills,

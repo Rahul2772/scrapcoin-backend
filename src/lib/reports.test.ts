@@ -95,3 +95,24 @@ test("dates are read in IST and quiet customers are listed to win back", () => {
   assert.equal(r.reengage[0].name, "Asha");
   assert.equal(r.reengage[0].days_since_last, 60);
 });
+
+test("donated pickups are counted apart and don't lower the buying rate", () => {
+  const r = buildReports({
+    ...base,
+    from: "2026-10-01", to: "2026-10-31", today: "2026-11-04",
+    expensesTotal: 0,
+    receipts: [
+      { receipt_number: "RCP-1", customer_id: "c1", material_id: "news", weight: 10, total_amount: 100, payment_method: "cash", created_at: "2026-10-05T05:00:00Z" },
+      { receipt_number: "RCP-2", customer_id: "c2", material_id: "news", weight: 30, total_amount: 0, payment_method: "donation", created_at: "2026-10-12T05:00:00Z" },
+    ],
+  });
+
+  assert.deepEqual(r.summary.donated, { pickups: 1, kg: 30, est_value: 450 });
+  assert.equal(r.bills.find((b) => b.bill_no === "RCP-2")!.donated, true);
+  assert.equal(r.bills.find((b) => b.bill_no === "RCP-1")!.donated, false);
+  const news = r.materials.find((m) => m.material_id === "news")!;
+  assert.equal(news.kg_bought, 40);
+  assert.equal(news.kg_donated, 30);
+  assert.equal(news.avg_buy_rate, 10); // 100 paid for the 10 kg that were bought
+  assert.equal(news.margin_per_kg, 5);
+});

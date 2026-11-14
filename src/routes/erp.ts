@@ -118,6 +118,9 @@ const transactionSchema = z.object({
   })).optional(),
 });
 
+// payment_method for a pickup the customer donated (no money paid)
+const DONATION = "donation";
+
 const purchaseReceiptSchema = z.object({
   customer_id: z.string().trim().optional().nullable().transform((val) => (val === "" ? null : val)),
   payment_method: z.string().optional().default("cash"),
@@ -133,6 +136,13 @@ const purchaseReceiptSchema = z.object({
     weight: z.number().positive(),
     price_per_unit: z.number().nonnegative(),
   })).optional(),
+}).superRefine((d, ctx) => {
+  // A donated pickup is one the customer gave us for free: nothing was paid
+  if (d.payment_method !== DONATION) return;
+  const prices = d.items?.length ? d.items.map((i) => i.price_per_unit) : [d.price_per_unit ?? 0];
+  if (prices.some((p) => p !== 0)) {
+    ctx.addIssue({ code: "custom", path: ["payment_method"], message: "A donated pickup must have a buying rate of ₹0 for every item." });
+  }
 });
 
 
@@ -2319,7 +2329,7 @@ erpRouter.get("/reports", async (req, res) => {
   try {
     const [receipts, sales, customers, materials, expenses] = await Promise.all([
       fetchAll<any>((a, b) => supabase.from("erp_purchase_receipts")
-        .select("receipt_number, customer_id, material_id, weight, total_amount, created_at").order("id").range(a, b)),
+        .select("receipt_number, customer_id, material_id, weight, total_amount, payment_method, created_at").order("id").range(a, b)),
       fetchAll<any>((a, b) => supabase.from("erp_transactions")
         .select("material_id, weight, subtotal, total_amount, created_at").order("id").range(a, b)),
       fetchAll<any>((a, b) => supabase.from("erp_customers").select("*").order("id").range(a, b)),
